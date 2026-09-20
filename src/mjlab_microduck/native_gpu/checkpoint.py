@@ -54,18 +54,24 @@ def capture(env):
             visit(child, path + (part,))
 
     visit(env, ())
-    arrays = jax.tree.leaves(env.sim._state)
-    return {
+    result = {
         "leaves": leaves,
-        "physics": [torch.from_numpy(np.asarray(a).copy()) for a in arrays],
-        "stat_meaninertia": torch.from_numpy(
-            np.asarray(env.sim._device_fields["stat_meaninertia"]).copy()
-        ),
         "random": random.getstate(),
         "numpy_random": np.random.get_state(),
         "torch_random": torch.get_rng_state(),
         "mps_random": torch.mps.get_rng_state(),
     }
+    if hasattr(env.sim, "capture_physics"):
+        result["native_physics"] = env.sim.capture_physics()
+    else:
+        result["physics"] = [
+            torch.from_numpy(np.asarray(a).copy())
+            for a in jax.tree.leaves(env.sim._state)
+        ]
+        result["stat_meaninertia"] = torch.from_numpy(
+            np.asarray(env.sim._device_fields["stat_meaninertia"]).copy()
+        )
+    return result
 
 
 def _get(value, part):
@@ -111,20 +117,23 @@ def restore(env, state):
                 unchanged = False
             if not unchanged:
                 _set(parent, path[-1], saved)
-    current, tree = jax.tree.flatten(env.sim._state)
-    if len(current) != len(state["physics"]):
-        raise ValueError("Checkpoint physics layout differs")
-    for a, b in zip(current, state["physics"]):
-        if a.shape != tuple(b.shape):
-            raise ValueError("Checkpoint physics shape differs")
-    env.sim._state = jax.tree.unflatten(
-        tree, [jax.numpy.asarray(a.numpy()) for a in state["physics"]]
-    )
-    env.sim._versions.clear()
-    env.sim._device_fields = {
-        "stat_meaninertia": jax.numpy.asarray(state["stat_meaninertia"].numpy())
-    }
-    env.sim._sync_out()
+    if "native_physics" in state:
+        env.sim.restore_physics(state["native_physics"])
+    else:
+        current, tree = jax.tree.flatten(env.sim._state)
+        if len(current) != len(state["physics"]):
+            raise ValueError("Checkpoint physics layout differs")
+        for a, b in zip(current, state["physics"]):
+            if a.shape != tuple(b.shape):
+                raise ValueError("Checkpoint physics shape differs")
+        env.sim._state = jax.tree.unflatten(
+            tree, [jax.numpy.asarray(a.numpy()) for a in state["physics"]]
+        )
+        env.sim._versions.clear()
+        env.sim._device_fields = {
+            "stat_meaninertia": jax.numpy.asarray(state["stat_meaninertia"].numpy())
+        }
+        env.sim._sync_out()
     if hasattr(env, "scene"):
         for sensor in env.scene._sensors.values():
             sensor._invalidate_cache()

@@ -5,41 +5,67 @@ The current entry point runs `Mjlab-Velocity-Flat-MicroDuck`; rough terrain is
 not yet supported by this adapter. Run from the repository root with a recent uv.
 
 **Validation hardware: Apple M1 Max with 32 GB of unified memory (24-core GPU).**
-The training parameters below—64 parallel environments, 24 rollout steps per
-PPO update, five smoke-test updates, and a checkpoint every update—were validated
-on this machine with native Apple GPU execution. Checkpoint resume and ONNX
-export comparison also passed. These results do not establish performance or
-memory requirements for other Mac configurations, larger environment counts,
-rough terrain, or learned walking quality.
+The recommended mode is native CPU MuJoCo physics with Torch MPS policy inference,
+BAM actuator calculations, task managers and PPO learning. It preserves the original
+flat task's rewards, commands, randomization and learner configuration.
 
 ```bash
 uv sync --locked --extra mac-gpu --python 3.12
 uv run --locked --extra mac-gpu python -m mjlab_microduck.native_gpu.train \
-  --num-envs 64 --iterations 5 --save-interval 1 \
+  --physics cpu --num-envs 64 --iterations 5 --save-interval 1 \
   --log-dir logs/native-gpu/smoke
 ```
 
-The command selects JAX MPS and Torch MPS and disables CPU numerical fallback.
-JAX/Torch transfers currently pass through host memory. Compilation and detailed
-mesh collisions can make the first run slow.
+`--physics cpu` is the default. The five-update smoke test and a five-update full
+checkpoint continuation passed with 64 environments, 24 rollout steps per update,
+finite losses/gradients, no logged NaN terminations, and normalized ONNX export
+comparison. This does not establish useful walking or performance on other Macs.
+
+The `mac-gpu` dependency extra supports both physics modes. Torch MPS fallback is
+disabled in both: choosing CPU physics is explicit, not a silent GPU fallback.
+
+### Physics backend measurements
+
+Initial measurements on the M1 Max, using the same canonical flat-task settings,
+64 environments and 1,536 transitions per PPO update:
+
+| Mode | Mean seconds/update | Transitions/second |
+| --- | ---: | ---: |
+| MJX/Metal physics + MPS learner, earlier five-update smoke | 174.46 | 8.80 |
+| CPU MuJoCo physics + MPS learner, five-update smoke | 5.45 | 282.00 |
+
+These are full rollout-plus-PPO timings, excluding initialization, checkpoint/export
+I/O and validation. They show about a 32-fold improvement for the hybrid mode in
+these runs. They are not a trajectory-matched physics comparison or a learning
+quality benchmark: native MuJoCo and MJX use different collision implementations
+and numerical precision, and the runs did not start from identical physics state.
+Repeat broader benchmarks before extrapolating to other tasks or hardware.
+
+To investigate the experimental Apple GPU physics path, select `--physics mps`
+and use a separate log directory. It works for flat-task smoke tests but remains
+slower; it is retained for phase 3 comparisons, not recommended for the first
+learning campaign. Host memory transfers are used between JAX and Torch MPS.
 
 Use a **new log directory** for each invocation. To continue a trusted checkpoint
-with the same environment count and compatible pinned dependencies/source:
+with the same environment count, physics backend and compatible pinned dependencies/source:
 
 ```bash
 uv run --locked --extra mac-gpu python -m mjlab_microduck.native_gpu.train \
-  --num-envs 64 --iterations 1000 --save-interval 5 \
+  --physics cpu --num-envs 64 --iterations 1000 --save-interval 5 \
   --resume logs/native-gpu/smoke/model_4.pt \
   --log-dir logs/native-gpu/continued
 ```
 
-The 1,000-update continuation above was started on the same M1 Max with 32 GB
-of unified memory. Its initial updates and checkpoints were verified; completion
-of the full campaign and policy quality have not yet been validated.
+The longer campaign uses the recommended hybrid mode on the same M1 Max.
+Full-campaign completion and policy quality still require validation. The earlier
+GPU-physics campaign is paused with its checkpoints retained.
 
 `--iterations` counts additional PPO updates. The run saves checkpoints after its
 first update, at the requested interval, and on normal completion. Checkpoints
-include the learner, native environment and RNG state; they are trusted Python
+include the learner, native environment and RNG state. Full environment continuation
+requires the same physics backend. Loading a checkpoint from another backend
+retains the learner and progress but starts fresh episodes, reported in
+`status.json` as `learner_and_progress_with_fresh_episodes`. Checkpoints are trusted Python
 serialization files, not portable deployment artifacts.
 
 Run outputs:
@@ -58,7 +84,7 @@ robot runtime integration and useful walking behavior still require validation.
 
 Playback runs one robot in the native MuJoCo 3D viewer using CPU physics and ONNX
 Runtime inference. This is a separate validation process: it does not show the
-live GPU training environments or interrupt the trainer. Early checkpoints may
+live training environments or interrupt the trainer. Early checkpoints may
 stand still, stumble or fall; a successful replay is not evidence of learned walking.
 
 From the repository root, after installing the environment above:

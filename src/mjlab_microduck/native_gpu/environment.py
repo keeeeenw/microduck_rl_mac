@@ -155,8 +155,17 @@ _original_init = _with_globals(
 
 
 class MetalEnv(ManagerBasedRlEnv):
-    def __init__(self, cfg, device="mps", **kwargs):
-        _original_init(self, cfg, device, **kwargs)
+    def __init__(self, cfg, device="mps", physics="mps", **kwargs):
+        initialize = _original_init
+        if physics == "cpu":
+            from .cpu_simulation import CpuSimulation
+
+            initialize = _with_globals(
+                ManagerBasedRlEnv.__init__, Scene=MetalScene, Simulation=CpuSimulation
+            )
+        elif physics != "mps":
+            raise ValueError(f"Unknown physics backend: {physics}")
+        initialize(self, cfg, device, **kwargs)
         self.sim._sensors = [
             s for s in self.scene._sensors.values() if isinstance(s, MetalTerrainHeight)
         ]

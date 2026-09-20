@@ -1,4 +1,4 @@
-"""Train the canonical flat task on Apple GPUs with local logs/checkpoints."""
+"""Train the canonical flat task on Mac with MPS learning and selectable physics."""
 
 import argparse
 import dataclasses
@@ -29,10 +29,16 @@ def main():
     parser.add_argument("--save-interval", type=int, default=25)
     parser.add_argument("--log-dir", type=Path, required=True)
     parser.add_argument("--resume", type=Path)
+    parser.add_argument(
+        "--physics",
+        choices=("mps", "cpu"),
+        default="cpu",
+        help="Physics backend (default: cpu). Policy inference and PPO always use MPS.",
+    )
     args = parser.parse_args()
     if min(args.num_envs, args.iterations, args.save_interval) < 1:
         parser.error("Environment count, iterations and save interval must be positive")
-    os.environ["JAX_PLATFORMS"] = "mps"
+    os.environ["JAX_PLATFORMS"] = "mps" if args.physics == "mps" else "cpu"
     os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
     os.environ.setdefault("WANDB_MODE", "disabled")
     directory = args.log_dir.resolve()
@@ -51,7 +57,10 @@ def main():
         "completed_iterations": 0,
         "task": "Mjlab-Velocity-Flat-MicroDuck",
         "device": "mps",
-        "transfer_mode": "host-staged copies between GPU frameworks; no CPU numerics",
+        "physics_backend": args.physics,
+        "transfer_mode": "CPU physics / MPS managers, BAM and PPO"
+        if args.physics == "cpu"
+        else "host-staged copies between GPU frameworks; no CPU numerics",
     }
     atomic_json(status_path, status)
     source_root = Path(__file__).resolve().parents[1]
@@ -114,7 +123,7 @@ def main():
         atomic_json(directory / "agent.json", agent)
         status["stage"] = "constructing_environment"
         atomic_json(status_path, status)
-        env = MetalEnv(env_cfg)
+        env = MetalEnv(env_cfg, physics=args.physics)
         status["stage"] = "resetting_environment"
         atomic_json(status_path, status)
         wrapper = RslRlVecEnvWrapper(env, clip_actions=agent["clip_actions"])
@@ -124,12 +133,15 @@ def main():
             wrapper, agent, log_dir=str(directory), device="mps"
         )
         if args.resume:
-            runner.load(str(args.resume.resolve()), map_location="mps")
+            runner.load(str(args.resume.resolve()), map_location="cpu")
             saved = torch.load(
                 args.resume.resolve(), map_location="cpu", weights_only=False
             )
             native = saved.get("native_gpu", {})
-            if native.get("schema") == 2:
+            if (
+                native.get("schema") == 2
+                and native.get("physics_backend", "mps") == args.physics
+            ):
                 from .checkpoint import restore
 
                 restore(env, native["environment"])
@@ -200,7 +212,11 @@ def main():
             saved["iter"] = _runner.current_learning_iteration + 1
             from .checkpoint import capture
 
-            saved["native_gpu"] = {"schema": 2, "environment": capture(env)}
+            saved["native_gpu"] = {
+                "schema": 2,
+                "physics_backend": args.physics,
+                "environment": capture(env),
+            }
             torch.save(saved, temporary)
             temporary.replace(path)
             status["checkpoint"] = str(path)
