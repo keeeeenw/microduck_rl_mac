@@ -121,12 +121,21 @@ for this comparison. `--delay 3 6` enables actuator delay in physics steps, and
 `--lin-vel-x 0.05` starts with a small forward command. Playback uses nominal
 battery settings and is not a replica of the randomized training distribution.
 
+The delay buffer advances at 200 Hz: 3–6 physics steps means 15–30 ms,
+while policy inference runs at 50 Hz. Earlier playback incorrectly advanced
+that buffer at policy rate (60–120 ms), which could make a standing policy fall.
+Restart playback after updating to pick up the corrected timing and latest export.
+
+A 1,000-update run with 64 environments is an initial learning baseline, not a
+walking qualification. It collects 1,536,000 transitions; assess sustained upright
+motion and commanded velocity tracking, not the percentage of updates completed.
+
 Type commands in the **terminal that launched playback**, not the viewer window.
 The terminal must be interactive (TTY); redirecting stdin disables keyboard input.
 
 | Key | Effect in default velocity mode |
 | --- | --- |
-| Up / Down | Increase / decrease forward velocity command |
+| Up / Down | Set forward velocity to +0.30 / −0.30 m/s (plain walking mode) |
 | Left / Right | Change lateral velocity command |
 | A / E | Change turning command |
 | Space | Zero movement commands; does not reset the robot pose |

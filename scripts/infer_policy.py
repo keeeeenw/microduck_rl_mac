@@ -864,7 +864,7 @@ class PolicyInference:
         return action
 
     def apply_action(self, action):
-        """Apply action to MuJoCo controls with optional delay."""
+        """Apply one physics step's action target with optional physics-step delay."""
         if self.use_delay:
             self.action_buffer[self.buffer_index] = action.copy()
             delayed_index = (self.buffer_index - self.current_lag) % len(self.action_buffer)
@@ -892,6 +892,19 @@ class PolicyInference:
             self.bam_ctrl.q_target[:] = target_positions
         else:
             self.data.ctrl[:] = target_positions
+
+
+def step_policy_physics(model, data, policy, action, bam_ctrl, decimation=4):
+    """Hold a policy output while advancing the actuator delay at physics rate.
+
+    Passing None preserves the last motor target while inference is paused.
+    """
+    for _ in range(decimation):
+        if action is not None:
+            policy.apply_action(action)
+        if bam_ctrl is not None:
+            bam_ctrl.update()
+        mujoco.mj_step(model, data)
 
 
 # ---------------------------------------------------------------------------
@@ -1681,7 +1694,6 @@ def main():
 
                 if policy_enabled:
                     action = policy.infer()
-                    policy.apply_action(action)
                 else:
                     # Paused: keep last ctrl, don't query the policy. Motors
                     # hold position. Use a zero action just so downstream
@@ -1767,14 +1779,10 @@ def main():
                         print(f"  Applied ctrl ({ctrl_kind}, first 5): {data.ctrl[:5]}")
                         print(f"  Applied ctrl ({ctrl_kind}, last 5):  {data.ctrl[-5:]}")
 
-                for _ in range(decimation):
-                    if bam_ctrl is not None:
-                        # BAM owns control/torque/friction: update() runs the
-                        # firmware P-loop + DC-motor equation, writes the torque
-                        # to data.ctrl and pushes the friction budget onto the
-                        # dofs so MuJoCo's solver applies it on this step.
-                        bam_ctrl.update()
-                    mujoco.mj_step(model, data)
+                step_policy_physics(
+                    model, data, policy, action if policy_enabled else None,
+                    bam_ctrl, decimation,
+                )
 
                 if odom_compare is not None:
                     odom_compare.step(data)

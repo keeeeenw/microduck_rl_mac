@@ -95,3 +95,34 @@ def test_bam_step_loop_runs_with_live_friction(bam_sim):
     assert (np.abs(data.ctrl) <= limit + 1e-9).all()  # ctrl IS the motor torque
     assert (model.dof_frictionloss[dofs] > 0).all()  # BAM budget written every step
     assert np.allclose(model.dof_damping[dofs], bam_model.friction_viscous.value)
+
+
+def test_playback_delay_uses_physics_steps_and_pause_holds_target(ip, monkeypatch):
+    # Use the real action buffer with a fixed three-physics-step latency.
+    # With four substeps/control step, the first target must arrive in the
+    # first control interval, rather than three control intervals later.
+    from types import SimpleNamespace
+
+    policy = ip.PolicyInference.__new__(ip.PolicyInference)
+    policy.use_delay = True
+    policy.action_buffer = np.zeros((7, 1), dtype=np.float32)
+    policy.buffer_index = 0
+    policy.current_lag = 3
+    policy.default_pose = np.zeros(1)
+    policy.action_scale = 1.0
+    policy.new_cmd_obs = True
+    policy.bam_ctrl = SimpleNamespace(q_target=np.zeros(1))
+    targets = []
+    policy.bam_ctrl.update = lambda: targets.append(policy.bam_ctrl.q_target.copy())
+    monkeypatch.setattr(ip.mujoco, "mj_step", lambda model, data: None)
+
+    ip.step_policy_physics(None, None, policy, np.array([1.0]), policy.bam_ctrl)
+    np.testing.assert_array_equal(np.array(targets).ravel(), [0, 0, 0, 1])
+    targets.clear()
+    ip.step_policy_physics(None, None, policy, np.array([2.0]), policy.bam_ctrl)
+    np.testing.assert_array_equal(np.array(targets).ravel(), [1, 1, 1, 2])
+    targets.clear()
+    index = policy.buffer_index
+    ip.step_policy_physics(None, None, policy, None, policy.bam_ctrl)
+    np.testing.assert_array_equal(np.array(targets).ravel(), [2, 2, 2, 2])
+    assert policy.buffer_index == index
