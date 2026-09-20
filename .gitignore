@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Traces & large outputs
+*.trace
+*.gputrace
+*.bin
+*.log
+results/*.json
+!configs/*.json
+
+# macOS
+.DS_Store

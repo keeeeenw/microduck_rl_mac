@@ -1,0 +1,320 @@
+{
+  "benchmark_metadata": {
+    "date": "2026-09-20 13:31:29",
+    "platform": "macOS-26.6.2-arm64-arm-64bit",
+    "machine": "arm64",
+    "processor": "arm",
+    "python_version": "3.12.10 (main, Apr  9 2025, 03:49:38) [Clang 20.1.0 ]",
+    "torch_version": "2.9.1",
+    "contention": {
+      "competing_processes_detected": true,
+      "competing_process_count": 1,
+      "sample_command": "zixiao            4632  90.0 17.8 508562576 5983248   ??  Rs    1:13AM 670:20.55 /Users/zixiao/workspace/microduck/micro",
+      "window_type": "concurrent-load (background training running)"
+    },
+    "workload_description": "5-stage physics representative sequence (kinematics, broadphase, actuation, integration, sensors), 4 substeps (20 kernel launches per step)",
+    "disclaimer": "This benchmark measures submission and kernel dispatch latency on PyTorch MPS. It does not measure iterative constraint solver convergence or full CAD narrow phase arithmetic."
+  },
+  "results": [
+    {
+      "num_envs": 1,
+      "trials": 100,
+      "substeps": 4,
+      "kernels_per_control_step": 20,
+      "cpu_submission": {
+        "total_s": 0.005848624976351857,
+        "us_per_control_step": 58.48624976351857,
+        "us_per_kernel_dispatch": 2.9243124881759286
+      },
+      "gpu_completion_event": {
+        "total_ms": 10.645375,
+        "ms_per_control_step": 0.10645375,
+        "us_per_kernel_execution": 5.3226875
+      },
+      "end_to_end_wall_clock": {
+        "total_s": 0.011056957999244332,
+        "ms_per_control_step": 0.11056957999244332,
+        "control_steps_per_second": 9044.078851238679,
+        "physics_substeps_per_second": 36176.315404954716
+      },
+      "memory": {
+        "alloc_baseline_bytes": 2304,
+        "alloc_final_bytes": 2304,
+        "alloc_delta_bytes": 0,
+        "driver_baseline_bytes": 17186816,
+        "driver_final_bytes": 17186816,
+        "driver_delta_bytes": 0
+      }
+    },
+    {
+      "num_envs": 8,
+      "trials": 100,
+      "substeps": 4,
+      "kernels_per_control_step": 20,
+      "cpu_submission": {
+        "total_s": 0.005440416978672147,
+        "us_per_control_step": 54.40416978672147,
+        "us_per_kernel_dispatch": 2.7202084893360734
+      },
+      "gpu_completion_event": {
+        "total_ms": 11.234708999999999,
+        "ms_per_control_step": 0.11234708999999998,
+        "us_per_kernel_execution": 5.617354499999999
+      },
+      "end_to_end_wall_clock": {
+        "total_s": 0.011350458022207022,
+        "ms_per_control_step": 0.11350458022207022,
+        "control_steps_per_second": 8810.2171563783,
+        "physics_substeps_per_second": 35240.8686255132
+      },
+      "memory": {
+        "alloc_baseline_bytes": 8448,
+        "alloc_final_bytes": 8448,
+        "alloc_delta_bytes": 0,
+        "driver_baseline_bytes": 17186816,
+        "driver_final_bytes": 17186816,
+        "driver_delta_bytes": 0
+      }
+    },
+    {
+      "num_envs": 32,
+      "trials": 100,
+      "substeps": 4,
+      "kernels_per_control_step": 20,
+      "cpu_submission": {
+        "total_s": 0.0053759170696139336,
+        "us_per_control_step": 53.759170696139336,
+        "us_per_kernel_dispatch": 2.687958534806967
+      },
+      "gpu_completion_event": {
+        "total_ms": 12.386458999999999,
+        "ms_per_control_step": 0.12386458999999998,
+        "us_per_kernel_execution": 6.193229499999999
+      },
+      "end_to_end_wall_clock": {
+        "total_s": 0.010901416884735227,
+        "ms_per_control_step": 0.10901416884735227,
+        "control_steps_per_second": 9173.1195180716,
+        "physics_substeps_per_second": 36692.4780722864
+      },
+      "memory": {
+        "alloc_baseline_bytes": 30976,
+        "alloc_final_bytes": 30976,
+        "alloc_delta_bytes": 0,
+        "driver_baseline_bytes": 17186816,
+        "driver_final_bytes": 17186816,
+        "driver_delta_bytes": 0
+      }
+    },
+    {
+      "num_envs": 64,
+      "trials": 100,
+      "substeps": 4,
+      "kernels_per_control_step": 20,
+      "cpu_submission": {
+        "total_s": 0.005327958147972822,
+        "us_per_control_step": 53.27958147972822,
+        "us_per_kernel_dispatch": 2.663979073986411
+      },
+      "gpu_completion_event": {
+        "total_ms": 13.008583999999999,
+        "ms_per_control_step": 0.13008583999999998,
+        "us_per_kernel_execution": 6.5042919999999995
+      },
+      "end_to_end_wall_clock": {
+        "total_s": 0.010731207905337214,
+        "ms_per_control_step": 0.10731207905337214,
+        "control_steps_per_second": 9318.615470143352,
+        "physics_substeps_per_second": 37274.461880573406
+      },
+      "memory": {
+        "alloc_baseline_bytes": 65792,
+        "alloc_final_bytes": 65792,
+        "alloc_delta_bytes": 0,
+        "driver_baseline_bytes": 17186816,
+        "driver_final_bytes": 17186816,
+        "driver_delta_bytes": 0
+      }
+    },
+    {
+      "num_envs": 128,
+      "trials": 100,
+      "substeps": 4,
+      "kernels_per_control_step": 20,
+      "cpu_submission": {
+        "total_s": 0.005394167033955455,
+        "us_per_control_step": 53.94167033955455,
+        "us_per_kernel_dispatch": 2.6970835169777274
+      },
+      "gpu_completion_event": {
+        "total_ms": 14.07625,
+        "ms_per_control_step": 0.1407625,
+        "us_per_kernel_execution": 7.038125
+      },
+      "end_to_end_wall_clock": {
+        "total_s": 0.010684499982744455,
+        "ms_per_control_step": 0.10684499982744455,
+        "control_steps_per_second": 9359.352347933991,
+        "physics_substeps_per_second": 37437.409391735964
+      },
+      "memory": {
+        "alloc_baseline_bytes": 133632,
+        "alloc_final_bytes": 133632,
+        "alloc_delta_bytes": 0,
+        "driver_baseline_bytes": 17186816,
+        "driver_final_bytes": 17186816,
+        "driver_delta_bytes": 0
+      }
+    },
+    {
+      "num_envs": 256,
+      "trials": 100,
+      "substeps": 4,
+      "kernels_per_control_step": 20,
+      "cpu_submission": {
+        "total_s": 0.005506332963705063,
+        "us_per_control_step": 55.06332963705063,
+        "us_per_kernel_dispatch": 2.7531664818525314
+      },
+      "gpu_completion_event": {
+        "total_ms": 10.816917,
+        "ms_per_control_step": 0.10816917,
+        "us_per_kernel_execution": 5.4084585
+      },
+      "end_to_end_wall_clock": {
+        "total_s": 0.011193499900400639,
+        "ms_per_control_step": 0.11193499900400639,
+        "control_steps_per_second": 8933.756277285605,
+        "physics_substeps_per_second": 35735.02510914242
+      },
+      "memory": {
+        "alloc_baseline_bytes": 267008,
+        "alloc_final_bytes": 267008,
+        "alloc_delta_bytes": 0,
+        "driver_baseline_bytes": 17186816,
+        "driver_final_bytes": 17186816,
+        "driver_delta_bytes": 0
+      }
+    },
+    {
+      "num_envs": 512,
+      "trials": 100,
+      "substeps": 4,
+      "kernels_per_control_step": 20,
+      "cpu_submission": {
+        "total_s": 0.005439083091914654,
+        "us_per_control_step": 54.39083091914654,
+        "us_per_kernel_dispatch": 2.719541545957327
+      },
+      "gpu_completion_event": {
+        "total_ms": 16.029583,
+        "ms_per_control_step": 0.16029583,
+        "us_per_kernel_execution": 8.0147915
+      },
+      "end_to_end_wall_clock": {
+        "total_s": 0.012708500027656555,
+        "ms_per_control_step": 0.12708500027656555,
+        "control_steps_per_second": 7868.749245180588,
+        "physics_substeps_per_second": 31474.996980722353
+      },
+      "memory": {
+        "alloc_baseline_bytes": 534016,
+        "alloc_final_bytes": 534016,
+        "alloc_delta_bytes": 0,
+        "driver_baseline_bytes": 17186816,
+        "driver_final_bytes": 17186816,
+        "driver_delta_bytes": 0
+      }
+    },
+    {
+      "num_envs": 1024,
+      "trials": 100,
+      "substeps": 4,
+      "kernels_per_control_step": 20,
+      "cpu_submission": {
+        "total_s": 0.005356000037863851,
+        "us_per_control_step": 53.560000378638506,
+        "us_per_kernel_dispatch": 2.6780000189319253
+      },
+      "gpu_completion_event": {
+        "total_ms": 15.143125,
+        "ms_per_control_step": 0.15143125,
+        "us_per_kernel_execution": 7.5715625
+      },
+      "end_to_end_wall_clock": {
+        "total_s": 0.016136416932567954,
+        "ms_per_control_step": 0.16136416932567954,
+        "control_steps_per_second": 6197.162630210124,
+        "physics_substeps_per_second": 24788.650520840496
+      },
+      "memory": {
+        "alloc_baseline_bytes": 1068032,
+        "alloc_final_bytes": 1068032,
+        "alloc_delta_bytes": 0,
+        "driver_baseline_bytes": 17186816,
+        "driver_final_bytes": 17186816,
+        "driver_delta_bytes": 0
+      }
+    },
+    {
+      "num_envs": 2048,
+      "trials": 100,
+      "substeps": 4,
+      "kernels_per_control_step": 20,
+      "cpu_submission": {
+        "total_s": 0.005294542061164975,
+        "us_per_control_step": 52.94542061164975,
+        "us_per_kernel_dispatch": 2.6472710305824876
+      },
+      "gpu_completion_event": {
+        "total_ms": 19.004417,
+        "ms_per_control_step": 0.19004417,
+        "us_per_kernel_execution": 9.5022085
+      },
+      "end_to_end_wall_clock": {
+        "total_s": 0.01994033297523856,
+        "ms_per_control_step": 0.19940332975238562,
+        "control_steps_per_second": 5014.961391275545,
+        "physics_substeps_per_second": 20059.84556510218
+      },
+      "memory": {
+        "alloc_baseline_bytes": 2136064,
+        "alloc_final_bytes": 2136064,
+        "alloc_delta_bytes": 0,
+        "driver_baseline_bytes": 17186816,
+        "driver_final_bytes": 17186816,
+        "driver_delta_bytes": 0
+      }
+    },
+    {
+      "num_envs": 4096,
+      "trials": 100,
+      "substeps": 4,
+      "kernels_per_control_step": 20,
+      "cpu_submission": {
+        "total_s": 0.005215207813307643,
+        "us_per_control_step": 52.15207813307643,
+        "us_per_kernel_dispatch": 2.6076039066538215
+      },
+      "gpu_completion_event": {
+        "total_ms": 27.476167,
+        "ms_per_control_step": 0.27476167,
+        "us_per_kernel_execution": 13.7380835
+      },
+      "end_to_end_wall_clock": {
+        "total_s": 0.025865166913717985,
+        "ms_per_control_step": 0.25865166913717985,
+        "control_steps_per_second": 3866.203544465181,
+        "physics_substeps_per_second": 15464.814177860724
+      },
+      "memory": {
+        "alloc_baseline_bytes": 4272128,
+        "alloc_final_bytes": 4272128,
+        "alloc_delta_bytes": 0,
+        "driver_baseline_bytes": 50741248,
+        "driver_final_bytes": 50741248,
+        "driver_delta_bytes": 0
+      }
+    }
+  ]
+}

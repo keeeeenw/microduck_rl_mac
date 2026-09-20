@@ -1,0 +1,605 @@
+{
+  "provenance": {
+    "live_xml_sha256": "c0fa38aa02ca23c46cbe8b4a224abf7aa5ef4b25da113171f51e779294e92be5",
+    "snapshot_canonical_xml_sha256": "50e4fdf1e4045e4face124f694a64f1ab2ed7dea11df50058f39dde943be4eaa",
+    "hashes_match": false
+  },
+  "dimensions": {
+    "nq": 21,
+    "nv": 20,
+    "nu": 14,
+    "nbody": 17,
+    "njnt": 15,
+    "ngeom": 76,
+    "nsite": 8,
+    "nsensor": 11
+  },
+  "simulation_options": {
+    "timestep": 0.005,
+    "integrator": "mjINT_IMPLICITFAST",
+    "cone": "mjCONE_PYRAMIDAL",
+    "solver": "mjSOL_NEWTON",
+    "iterations": 10,
+    "ls_iterations": 20,
+    "tolerance": 1e-08,
+    "ls_tolerance": 0.01,
+    "gravity": [
+      0.0,
+      0.0,
+      -9.81
+    ],
+    "decimation": 4,
+    "control_dt": 0.02,
+    "nconmax": 35,
+    "njmax": 1500
+  },
+  "actuators": [
+    {
+      "index": 0,
+      "class": "FrictionDRBamActuatorCfg",
+      "motor_name": "xl330",
+      "model": "m6",
+      "target_names_expr": [
+        "^(?!passive_).*"
+      ],
+      "delay_min_lag": 3,
+      "delay_max_lag": 6,
+      "kp_fw": 200.0,
+      "vin_range": [
+        6.5,
+        8.2
+      ],
+      "vin_drop_gain_range": [
+        0.0,
+        0.2
+      ],
+      "vin_min": 6.0,
+      "stiff_frictionloss": true,
+      "bam_json_path": "/Users/zixiao/workspace/microduck/microduck_rl/.venv/lib/python3.12/site-packages/bam/params/xl330/m6.json",
+      "bam_params": {
+        "kt": 0.36601349688984386,
+        "R": 2.8113923539223227,
+        "armature": 0.0018077432831600838,
+        "q_offset": 0.0271132870444849,
+        "friction_base": 0.004771183165566,
+        "friction_stribeck": 0.004676345799486616,
+        "load_friction_motor": 0.2667860954283698,
+        "load_friction_external": 8.515871897059342e-06,
+        "load_friction_motor_stribeck": 1.0722918395099123e-05,
+        "load_friction_external_stribeck": 0.08077928978935671,
+        "load_friction_motor_quad": 0.009972471242139415,
+        "load_friction_external_quad": 0.004902565732332559,
+        "dtheta_stribeck": 2.890372094130307,
+        "alpha": 8.683259907618984,
+        "friction_viscous": 0.005359668274599504,
+        "model": "m6",
+        "actuator": "xl330"
+      }
+    }
+  ],
+  "collision_geoms_count": 6,
+  "collision_geoms": [
+    {
+      "id": 0,
+      "name": "terrain",
+      "body": "terrain",
+      "type": "mjGEOM_PLANE",
+      "contype": 1,
+      "conaffinity": 1
+    },
+    {
+      "id": 7,
+      "name": null,
+      "body": "robot/trunk_base",
+      "type": "mjGEOM_MESH",
+      "contype": 2,
+      "conaffinity": 2
+    },
+    {
+      "id": 24,
+      "name": null,
+      "body": "robot/leg",
+      "type": "mjGEOM_MESH",
+      "contype": 2,
+      "conaffinity": 2
+    },
+    {
+      "id": 27,
+      "name": "robot/left_foot_collision",
+      "body": "robot/ankle_left",
+      "type": "mjGEOM_MESH",
+      "contype": 1,
+      "conaffinity": 1
+    },
+    {
+      "id": 70,
+      "name": null,
+      "body": "robot/leg_2",
+      "type": "mjGEOM_MESH",
+      "contype": 2,
+      "conaffinity": 2
+    },
+    {
+      "id": 73,
+      "name": "robot/right_foot_collision",
+      "body": "robot/ankle_right",
+      "type": "mjGEOM_MESH",
+      "contype": 1,
+      "conaffinity": 1
+    }
+  ],
+  "sensors": {
+    "feet_ground_contact": {
+      "type": "ContactSensorCfg",
+      "fields": [
+        "found",
+        "force"
+      ],
+      "reduce": "netforce",
+      "track_air_time": true
+    },
+    "self_collision": {
+      "type": "ContactSensorCfg",
+      "fields": [
+        "found"
+      ],
+      "reduce": "none",
+      "track_air_time": false
+    },
+    "foot_height_scan": {
+      "type": "TerrainHeightSensorCfg",
+      "fields": null,
+      "reduce": null,
+      "track_air_time": null
+    }
+  },
+  "domain_randomization_events": {
+    "reset_base": {
+      "func": "reset_root_state_uniform",
+      "mode": "reset",
+      "params": {
+        "pose_range": "{'x': (-0.5, 0.5), 'y': (-0.5, 0.5), 'z': (0.12, 0.13), 'yaw': (-3.14, 3.14)}",
+        "velocity_range": "{}"
+      }
+    },
+    "reset_robot_joints": {
+      "func": "reset_joints_by_offset",
+      "mode": "reset",
+      "params": {
+        "position_range": [
+          0.0,
+          0.0
+        ],
+        "velocity_range": [
+          0.0,
+          0.0
+        ],
+        "asset_cfg": "SceneEntityCfg(name='robot', joint_names=('.*',), joint_ids=slice(None, None, None), body_names=None, body_ids=slice(None, None, None), geom_names=None, geom_ids=slice(None, None, None), site_names=None, site_ids=slice(None, None, None), actuator_names=None, actuator_ids=slice(None, None, None), tendon_names=None, tendon_ids=slice(None, None, None), camera_names=None, camera_ids=slice(None, None, None), light_names=None, light_ids=slice(None, None, None), material_names=None, material_ids=slice(None, None, None), pair_names=None, pair_ids=slice(None, None, None), preserve_order=False)"
+      }
+    },
+    "push_robot": {
+      "func": "push_by_setting_velocity",
+      "mode": "interval",
+      "params": {
+        "velocity_range": "{'x': (-0.3, 0.3), 'y': (-0.3, 0.3)}",
+        "asset_cfg": "SceneEntityCfg(name='robot', joint_names=None, joint_ids=slice(None, None, None), body_names=None, body_ids=slice(None, None, None), geom_names=None, geom_ids=slice(None, None, None), site_names=None, site_ids=slice(None, None, None), actuator_names=None, actuator_ids=slice(None, None, None), tendon_names=None, tendon_ids=slice(None, None, None), camera_names=None, camera_ids=slice(None, None, None), light_names=None, light_ids=slice(None, None, None), material_names=None, material_ids=slice(None, None, None), pair_names=None, pair_ids=slice(None, None, None), preserve_order=False)"
+      }
+    },
+    "foot_friction": {
+      "func": "geom_friction",
+      "mode": "startup",
+      "params": {
+        "asset_cfg": "SceneEntityCfg(name='robot', joint_names=None, joint_ids=slice(None, None, None), body_names=None, body_ids=slice(None, None, None), geom_names=('left_foot_collision', 'right_foot_collision'), geom_ids=slice(None, None, None), site_names=None, site_ids=slice(None, None, None), actuator_names=None, actuator_ids=slice(None, None, None), tendon_names=None, tendon_ids=slice(None, None, None), camera_names=None, camera_ids=slice(None, None, None), light_names=None, light_ids=slice(None, None, None), material_names=None, material_ids=slice(None, None, None), pair_names=None, pair_ids=slice(None, None, None), preserve_order=False)",
+        "operation": "abs",
+        "ranges": [
+          0.7,
+          1.3
+        ],
+        "shared_random": true
+      }
+    },
+    "encoder_bias": {
+      "func": "encoder_bias",
+      "mode": "startup",
+      "params": {
+        "asset_cfg": "SceneEntityCfg(name='robot', joint_names=None, joint_ids=slice(None, None, None), body_names=None, body_ids=slice(None, None, None), geom_names=None, geom_ids=slice(None, None, None), site_names=None, site_ids=slice(None, None, None), actuator_names=None, actuator_ids=slice(None, None, None), tendon_names=None, tendon_ids=slice(None, None, None), camera_names=None, camera_ids=slice(None, None, None), light_names=None, light_ids=slice(None, None, None), material_names=None, material_ids=slice(None, None, None), pair_names=None, pair_ids=slice(None, None, None), preserve_order=False)",
+        "bias_range": [
+          -0.015,
+          0.015
+        ]
+      }
+    },
+    "base_com": {
+      "func": "body_com_offset",
+      "mode": "startup",
+      "params": {
+        "asset_cfg": "SceneEntityCfg(name='robot', joint_names=None, joint_ids=slice(None, None, None), body_names=(), body_ids=slice(None, None, None), geom_names=None, geom_ids=slice(None, None, None), site_names=None, site_ids=slice(None, None, None), actuator_names=None, actuator_ids=slice(None, None, None), tendon_names=None, tendon_ids=slice(None, None, None), camera_names=None, camera_ids=slice(None, None, None), light_names=None, light_ids=slice(None, None, None), material_names=None, material_ids=slice(None, None, None), pair_names=None, pair_ids=slice(None, None, None), preserve_order=False)",
+        "operation": "add",
+        "ranges": "{0: (-0.025, 0.025), 1: (-0.025, 0.025), 2: (-0.03, 0.03)}"
+      }
+    },
+    "expand_bam_friction_fields": {
+      "func": "expand_bam_friction_fields",
+      "mode": "startup",
+      "params": {}
+    },
+    "reset_action_history": {
+      "func": "reset_action_history",
+      "mode": "reset",
+      "params": {}
+    },
+    "randomize_com": {
+      "func": "body_com_offset",
+      "mode": "reset",
+      "params": {
+        "asset_cfg": "SceneEntityCfg(name='robot', joint_names=None, joint_ids=slice(None, None, None), body_names=('trunk_base',), body_ids=slice(None, None, None), geom_names=None, geom_ids=slice(None, None, None), site_names=None, site_ids=slice(None, None, None), actuator_names=None, actuator_ids=slice(None, None, None), tendon_names=None, tendon_ids=slice(None, None, None), camera_names=None, camera_ids=slice(None, None, None), light_names=None, light_ids=slice(None, None, None), material_names=None, material_ids=slice(None, None, None), pair_names=None, pair_ids=slice(None, None, None), preserve_order=False)",
+        "operation": "add",
+        "ranges": [
+          -0.003,
+          0.003
+        ]
+      }
+    },
+    "randomize_head_com": {
+      "func": "body_com_offset",
+      "mode": "reset",
+      "params": {
+        "asset_cfg": "SceneEntityCfg(name='robot', joint_names=None, joint_ids=slice(None, None, None), body_names=('neck', 'neck_pitch', 'yaw_roll_motion', '(bottom_head_shell|jaw_soft)', 'bearing_roll'), body_ids=slice(None, None, None), geom_names=None, geom_ids=slice(None, None, None), site_names=None, site_ids=slice(None, None, None), actuator_names=None, actuator_ids=slice(None, None, None), tendon_names=None, tendon_ids=slice(None, None, None), camera_names=None, camera_ids=slice(None, None, None), light_names=None, light_ids=slice(None, None, None), material_names=None, material_ids=slice(None, None, None), pair_names=None, pair_ids=slice(None, None, None), preserve_order=False)",
+        "operation": "add",
+        "ranges": [
+          -0.003,
+          0.003
+        ]
+      }
+    },
+    "randomize_mass_inertia": {
+      "func": "pseudo_inertia",
+      "mode": "startup",
+      "params": {
+        "asset_cfg": "SceneEntityCfg(name='robot', joint_names=None, joint_ids=slice(None, None, None), body_names=('trunk_base',), body_ids=slice(None, None, None), geom_names=None, geom_ids=slice(None, None, None), site_names=None, site_ids=slice(None, None, None), actuator_names=None, actuator_ids=slice(None, None, None), tendon_names=None, tendon_ids=slice(None, None, None), camera_names=None, camera_ids=slice(None, None, None), light_names=None, light_ids=slice(None, None, None), material_names=None, material_ids=slice(None, None, None), pair_names=None, pair_ids=slice(None, None, None), preserve_order=False)",
+        "alpha_range": [
+          -0.02564664719377529,
+          0.024395082084716024
+        ]
+      }
+    },
+    "randomize_joint_friction": {
+      "func": "randomize_bam_friction",
+      "mode": "reset",
+      "params": {
+        "asset_cfg": "SceneEntityCfg(name='robot', joint_names=None, joint_ids=slice(None, None, None), body_names=None, body_ids=slice(None, None, None), geom_names=None, geom_ids=slice(None, None, None), site_names=None, site_ids=slice(None, None, None), actuator_names=None, actuator_ids=slice(None, None, None), tendon_names=None, tendon_ids=slice(None, None, None), camera_names=None, camera_ids=slice(None, None, None), light_names=None, light_ids=slice(None, None, None), material_names=None, material_ids=slice(None, None, None), pair_names=None, pair_ids=slice(None, None, None), preserve_order=False)",
+        "scale_range": [
+          0.9,
+          1.1
+        ]
+      }
+    },
+    "randomize_armature": {
+      "func": "joint_armature",
+      "mode": "reset",
+      "params": {
+        "asset_cfg": "SceneEntityCfg(name='robot', joint_names=('.*',), joint_ids=slice(None, None, None), body_names=None, body_ids=slice(None, None, None), geom_names=None, geom_ids=slice(None, None, None), site_names=None, site_ids=slice(None, None, None), actuator_names=None, actuator_ids=slice(None, None, None), tendon_names=None, tendon_ids=slice(None, None, None), camera_names=None, camera_ids=slice(None, None, None), light_names=None, light_ids=slice(None, None, None), material_names=None, material_ids=slice(None, None, None), pair_names=None, pair_ids=slice(None, None, None), preserve_order=False)",
+        "operation": "scale",
+        "ranges": [
+          0.9,
+          1.1
+        ]
+      }
+    }
+  },
+  "curricula": {
+    "action_rate_weight": {
+      "func": "reward_weight",
+      "params": {
+        "reward_name": "action_rate_l2",
+        "weight_stages": [
+          {
+            "step": 0,
+            "weight": -0.1
+          },
+          {
+            "step": 12000,
+            "weight": -0.2
+          },
+          {
+            "step": 18000,
+            "weight": -0.4
+          },
+          {
+            "step": 24000,
+            "weight": -0.6
+          },
+          {
+            "step": 30000,
+            "weight": -0.8
+          },
+          {
+            "step": 36000,
+            "weight": -1.0
+          }
+        ]
+      }
+    },
+    "standing_envs": {
+      "func": "standing_envs_curriculum",
+      "params": {
+        "command_name": "twist",
+        "standing_stages": [
+          {
+            "step": 0,
+            "rel_standing_envs": 0.02
+          },
+          {
+            "step": 12000,
+            "rel_standing_envs": 0.05
+          },
+          {
+            "step": 18000,
+            "rel_standing_envs": 0.1
+          },
+          {
+            "step": 24000,
+            "rel_standing_envs": 0.15
+          },
+          {
+            "step": 36000,
+            "rel_standing_envs": 0.2
+          },
+          {
+            "step": 48000,
+            "rel_standing_envs": 0.25
+          }
+        ]
+      }
+    },
+    "head_pose_range": {
+      "func": "pose_command_range_curriculum",
+      "params": {
+        "command_name": "head_pose",
+        "range_stages": [
+          {
+            "step": 0,
+            "ranges": [
+              [
+                -0.05,
+                0.05
+              ],
+              [
+                -0.05,
+                0.05
+              ],
+              [
+                -0.07,
+                0.07
+              ],
+              [
+                -0.015,
+                0.015
+              ]
+            ]
+          },
+          {
+            "step": 12000,
+            "ranges": [
+              [
+                -0.17,
+                0.17
+              ],
+              [
+                -0.17,
+                0.17
+              ],
+              [
+                -0.21,
+                0.21
+              ],
+              [
+                -0.047,
+                0.047
+              ]
+            ]
+          },
+          {
+            "step": 24000,
+            "ranges": [
+              [
+                -0.39,
+                0.39
+              ],
+              [
+                -0.39,
+                0.39
+              ],
+              [
+                -0.49,
+                0.49
+              ],
+              [
+                -0.11,
+                0.11
+              ]
+            ]
+          },
+          {
+            "step": 36000,
+            "ranges": [
+              [
+                -0.72,
+                0.72
+              ],
+              [
+                -0.72,
+                0.72
+              ],
+              [
+                -0.91,
+                0.91
+              ],
+              [
+                -0.2,
+                0.2
+              ]
+            ]
+          },
+          {
+            "step": 48000,
+            "ranges": [
+              [
+                -1.1,
+                1.1
+              ],
+              [
+                -1.1,
+                1.1
+              ],
+              [
+                -1.4,
+                1.4
+              ],
+              [
+                -0.31,
+                0.31
+              ]
+            ]
+          }
+        ]
+      }
+    },
+    "body_pose_range": {
+      "func": "pose_command_range_curriculum",
+      "params": {
+        "command_name": "body_pose",
+        "range_stages": [
+          {
+            "step": 0,
+            "ranges": [
+              [
+                -0.005,
+                0.005
+              ],
+              [
+                -0.005,
+                0.005
+              ],
+              [
+                -0.005,
+                0.005
+              ],
+              [
+                -0.05,
+                0.05
+              ],
+              [
+                -0.05,
+                0.05
+              ],
+              [
+                -0.05,
+                0.05
+              ]
+            ]
+          }
+        ]
+      }
+    },
+    "com_range": {
+      "func": "com_range_curriculum",
+      "params": {
+        "event_name": "randomize_com",
+        "range_stages": [
+          {
+            "step": 0,
+            "range": 0.003
+          },
+          {
+            "step": 12000,
+            "range": 0.005
+          },
+          {
+            "step": 24000,
+            "range": 0.01
+          },
+          {
+            "step": 36000,
+            "range": 0.015
+          }
+        ]
+      }
+    },
+    "head_com_range": {
+      "func": "com_range_curriculum",
+      "params": {
+        "event_name": "randomize_head_com",
+        "range_stages": [
+          {
+            "step": 0,
+            "range": 0.003
+          },
+          {
+            "step": 12000,
+            "range": 0.005
+          },
+          {
+            "step": 24000,
+            "range": 0.01
+          }
+        ]
+      }
+    },
+    "head_pose_bias_weight": {
+      "func": "reward_weight",
+      "params": {
+        "reward_name": "head_pose_bias",
+        "weight_stages": [
+          {
+            "step": 0,
+            "weight": 0.0
+          },
+          {
+            "step": 14400,
+            "weight": 1.0
+          },
+          {
+            "step": 24000,
+            "weight": 2.0
+          },
+          {
+            "step": 36000,
+            "weight": 3.0
+          }
+        ]
+      }
+    }
+  },
+  "required_sim_data_fields": [
+    "time",
+    "qpos",
+    "qvel",
+    "qacc",
+    "qacc_warmstart",
+    "ctrl",
+    "act",
+    "qfrc_applied",
+    "xfrc_applied",
+    "qfrc_actuator",
+    "qfrc_bias",
+    "qfrc_constraint",
+    "xpos",
+    "xquat",
+    "xmat",
+    "xipos",
+    "ximat",
+    "geom_xpos",
+    "geom_xmat",
+    "site_xpos",
+    "site_xmat",
+    "cvel",
+    "cacc",
+    "subtree_com",
+    "subtree_linvel",
+    "subtree_angmom",
+    "sensordata",
+    "efc.force",
+    "nefc"
+  ]
+}

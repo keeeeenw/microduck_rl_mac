@@ -1,0 +1,30 @@
+{
+  "platform": {
+    "system": "Darwin",
+    "release": "25.6.0",
+    "version": "Darwin Kernel Version 25.6.0: Fri Jul 31 19:18:49 PDT 2026; root:xnu-12377.161.14~5/RELEASE_ARM64_T6000",
+    "machine": "arm64",
+    "processor": "arm"
+  },
+  "torch": {
+    "version": "2.9.1",
+    "mps_available": true,
+    "mps_built": true,
+    "compile_shader_available": true
+  },
+  "mujoco": {
+    "version": "3.10.0"
+  },
+  "git_repos": {
+    "microduck_rl": {
+      "commit": "f6b293fb68b97ad7d3dde24a82dd7d2b6317a6e3",
+      "branch": "develop",
+      "dirty": false
+    },
+    "mlx_assessment": {
+      "commit": "fa6e5fa0e96a2defcaadf40397b64cbef542e9b9",
+      "branch": "master",
+      "dirty": false
+    }
+  }
+}
