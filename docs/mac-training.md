@@ -41,6 +41,73 @@ quality benchmark: native MuJoCo and MJX use different collision implementations
 and numerical precision, and the runs did not start from identical physics state.
 Repeat broader benchmarks before extrapolating to other tasks or hardware.
 
+### Environment-count tuning on the M1 Max
+
+Before the transfer optimizations below, a sequential CPU-physics/MPS-PPO sweep
+on the same 32 GB M1 Max found:
+
+| Environments | Seconds/update | Transitions/second | Peak process RSS (GiB) |
+| ---: | ---: | ---: | ---: |
+| 512 | 14.09 | 872 | 2.95 |
+| 1,024 | 21.58 | 1,139 | 4.35 |
+| 2,048 | 40.86 | 1,203 | 7.32 |
+| 4,096 | 109.60 | 897 | 12.36 |
+
+Timings use updates 2–3 of fresh seed-42 runs, excluding startup and checkpoint
+I/O. These are short throughput measurements, not convergence comparisons. RSS
+is process resident memory, not total system or GPU memory usage. All four runs
+completed and passed normalized ONNX export comparison. An 8,192-environment
+trial initialized but took 69 and 76 seconds for its first two control steps,
+with increased system swap usage. It was stopped before PPO; it did not establish
+OOM-free training at that size.
+
+**2,048 environments was the fastest setting before these optimizations.** Keep 24
+rollout steps, five PPO epochs and four minibatches (12,288 samples/minibatch).
+PPO took only about 0.4 seconds/update; most time was rollout. CPU physics still
+steps worlds sequentially, so increasing environments does not use more CPU cores.
+CPU/MPS data transfers also contribute overhead. Parallel physics and reduced
+transfers were investigated next; parallel physics remains future work.
+
+The optimized bridge omits visualization-only environment-origin sites, eliminating
+quadratic site-pose storage and copies across worlds. It also sizes constraint
+buffers to active demand and copies directly into persistent MPS tensors. It still
+uses separate NumPy and MPS buffers; unified memory does not make it zero-copy.
+MuJoCo dynamics, robot sites and sensor values matched in regression tests. The
+original and optimized five-update 4,096-environment exports produced identical
+actions on 20 fixed synthetic observations, in addition to the normal export check.
+
+Post-optimization five-update trials (means over updates 2–5):
+
+| Environments | Seconds/update | Transitions/second | Peak process RSS (GiB) | Final checkpoint (MiB) |
+| ---: | ---: | ---: | ---: | ---: |
+| 2,048 | 28.76 | 1,709 | 5.68 | 41 |
+| 4,096 | 48.24 | 2,038 | 8.89 | 77 |
+
+The optimized 8,192 trial completed two PPO updates at 2,037 and 1,992
+transitions/second, with 12.15 GiB peak RSS. It was stopped because it offered no
+throughput benefit; it did not complete the five-update export-validation test.
+**Use 4,096 environments on this tested M1 Max configuration:** it has the best
+validated throughput here and preserves the original PPO batch size. These short
+measurements do not establish an optimum for other hardware or learning quality.
+
+```bash
+uv run --locked --extra mac-gpu python -m mjlab_microduck.native_gpu.train \
+  --physics cpu --num-envs 4096 --iterations 5 --save-interval 250 \
+  --log-dir logs/native-gpu/smoke-4096
+```
+
+Use sparse checkpoints: every 250 updates plus initial/final saves. Full native
+environment checkpoints grow with environment count (about 1 GiB at 4,096 before
+optimization, 77 MiB in the optimized test). They remain larger than portable ONNX
+policies. Use an external drive through `--log-dir` when desired, and keep it
+mounted throughout training and checkpoint/export access.
+
+At 2,048 environments, 8,000–12,000 updates collect as many transitions as the
+upstream 4,096-environment, 4,000–6,000-update gait budget. This is only sample-count
+equivalence: smaller PPO batches and the inherited curriculum change learning.
+The curriculum currently advances by environment steps, not aggregate transitions;
+review its schedule before a long campaign. The sweep does not validate walking.
+
 To investigate the experimental Apple GPU physics path, select `--physics mps`
 and use a separate log directory. It works for flat-task smoke tests but remains
 slower; it is retained for phase 3 comparisons, not recommended for the first
@@ -56,15 +123,27 @@ uv run --locked --extra mac-gpu python -m mjlab_microduck.native_gpu.train \
   --log-dir logs/native-gpu/continued
 ```
 
-The longer campaign uses the recommended hybrid mode on the same M1 Max.
-Full-campaign completion and policy quality still require validation. The earlier
-GPU-physics campaign is paused with its checkpoints retained.
+The initial 64-environment hybrid campaign and earlier GPU-physics campaign have
+been stopped with their checkpoints retained. The selected campaign continues the
+validated 4,096-environment checkpoint toward 6,000 total updates, with saves every
+250 updates on an external drive. Full-campaign completion and walking quality
+still require validation. For example, after the five-update smoke test:
+
+```bash
+uv run --locked --extra mac-gpu python -m mjlab_microduck.native_gpu.train \
+  --physics cpu --num-envs 4096 --iterations 5995 --save-interval 250 \
+  --resume logs/native-gpu/smoke-4096/model_4.pt \
+  --log-dir /Volumes/T7/microduck-rl/flat-4096
+```
+
+Replace the example external-drive directory with your mounted output location.
 
 `--iterations` counts additional PPO updates. The run saves checkpoints after its
 first update, at the requested interval, and on normal completion. Checkpoints
 include the learner, native environment and RNG state. Full environment continuation
-requires the same physics backend. Loading a checkpoint from another backend
-retains the learner and progress but starts fresh episodes, reported in
+requires the same physics backend and native scene layout. Loading a checkpoint
+from another backend or from before the origin-marker removal retains the learner
+and progress but starts fresh episodes, reported in
 `status.json` as `learner_and_progress_with_fresh_episodes`. Checkpoints are trusted Python
 serialization files, not portable deployment artifacts.
 

@@ -10,6 +10,7 @@ from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
 from mjlab.scene import Scene
 from mjlab.sensor.raycast_sensor import RayCastSensor
 from mjlab.sensor.terrain_height_sensor import TerrainHeightSensor
+from mjlab.terrains.terrain_entity import TerrainEntity
 from mjlab.utils.lab_api.math import quat_from_matrix
 
 from .simulation import MetalSimulation
@@ -133,7 +134,16 @@ class MetalTerrainHeight(TerrainHeightSensor):
         self._invalidate_cache()
 
 
+class NativeTerrainEntity(TerrainEntity):
+    def _add_env_origin_sites(self):
+        # Visualization only: adding N sites to each of N native worlds makes
+        # site pose storage and transfers quadratic. Keep env_origins itself.
+        pass
+
+
 class MetalScene(Scene):
+    _add_terrain = _with_globals(Scene._add_terrain, TerrainEntity=NativeTerrainEntity)
+
     def initialize(self, mj_model, model, data):
         self._default_env_origins = torch.zeros((self._cfg.num_envs, 3), device="mps")
         for entity in self._entities.values():

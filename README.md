@@ -19,6 +19,22 @@ Community support and pull requests are welcome. Reproducible bug reports,
 Apple Silicon test results, task validation and performance improvements help
 move the project forward. See the [training and playback guide](docs/mac-training.md).
 
+## Mac-specific improvements
+
+- **Native Apple GPU learning:** Torch MPS runs policy inference and PPO alongside
+  native CPU MuJoCo physics, preserving the original task and actuator models.
+- **Less copying and memory overhead:** the native training scene omits unused
+  environment visualization markers, and constraint buffers grow with actual
+  demand. This removes unnecessary work as environment counts increase.
+- **Playback aligned with training:** actuator delays advance at physics rate,
+  fixing excessive delay that could make a standing policy fall in playback.
+- **Portable policies and resumable training:** normalized ONNX exports target
+  the existing deployment interface; full checkpoints preserve native training
+  state, with configurable save intervals and external-drive output paths.
+
+See the training guide for measured results and validation limits. Apple Silicon's
+unified memory does not make this Python/Torch bridge zero-copy.
+
 ## Phases
 
 1. **Establish the best practical Mac setup for walking.** Get

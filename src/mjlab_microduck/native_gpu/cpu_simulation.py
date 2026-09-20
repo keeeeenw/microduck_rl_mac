@@ -86,17 +86,10 @@ class CpuSimulation:
                 np.float32
             )
             setattr(self.data, field, self.transfer.to_torch(array))
-        self._constraint_capacity = 4096
+        self._constraint_capacity = 0
         self.data.nefc = torch.zeros(num_envs, device="mps", dtype=torch.int32)
-        self.data.efc = SimpleNamespace(
-            type=torch.zeros(
-                (num_envs, self._constraint_capacity), device="mps", dtype=torch.int32
-            ),
-            id=torch.zeros(
-                (num_envs, self._constraint_capacity), device="mps", dtype=torch.int32
-            ),
-            force=torch.zeros((num_envs, self._constraint_capacity), device="mps"),
-        )
+        self.data.efc = SimpleNamespace()
+        self.ensure_constraint_capacity(128)
         from mjlab.utils.nan_guard import NanGuard
 
         self.nan_guard = NanGuard(cfg.nan_guard, num_envs, model)
@@ -128,16 +121,43 @@ class CpuSimulation:
             getattr(self._cpu_model, name)[:] = value[index]
         self._cpu_model.stat.meaninertia = self._meaninertia[index]
 
+    def ensure_constraint_capacity(self, required, *, exact=False):
+        """Grow the padded view without dropping any native constraint rows."""
+        if required <= self._constraint_capacity and not exact:
+            return
+        capacity = max(128, 1 << (int(required) - 1).bit_length())
+        if capacity == self._constraint_capacity:
+            return
+        for name, dtype in (
+            ("type", torch.int32),
+            ("id", torch.int32),
+            ("force", torch.float32),
+        ):
+            value = torch.zeros((self.num_envs, capacity), device="mps", dtype=dtype)
+            previous = getattr(self.data.efc, name, None)
+            if previous is not None:
+                retained = min(capacity, self._constraint_capacity)
+                value[:, :retained].copy_(previous[:, :retained])
+            setattr(self.data.efc, name, value)
+        self._constraint_capacity = capacity
+
+    def _copy_to_mps(self, target, value):
+        # Copy into the persistent destination directly. to_torch(...).copy_()
+        # allocated an intermediate MPS tensor and copied the data twice.
+        start = time.perf_counter()
+        target.copy_(torch.from_numpy(value))
+        self.transfer.bytes += value.nbytes
+        self.transfer.seconds += time.perf_counter() - start
+
     def _sync_out(self):
         for field in self._output_fields:
             value = np.stack([getattr(d, field) for d in self._worlds]).astype(
                 np.float32
             )
-            getattr(self.data, field).copy_(self.transfer.to_torch(value))
+            self._copy_to_mps(getattr(self.data, field), value)
         counts = np.array([d.nefc for d in self._worlds], dtype=np.int32)
-        if counts.max(initial=0) > self._constraint_capacity:
-            raise RuntimeError("Native constraint capacity exceeded")
-        self.data.nefc.copy_(self.transfer.to_torch(counts))
+        self.ensure_constraint_capacity(counts.max(initial=0))
+        self._copy_to_mps(self.data.nefc, counts)
         for name, dtype in (
             ("type", np.int32),
             ("id", np.int32),
@@ -146,7 +166,7 @@ class CpuSimulation:
             value = np.zeros((self.num_envs, self._constraint_capacity), dtype=dtype)
             for i, d in enumerate(self._worlds):
                 value[i, : d.nefc] = getattr(d, "efc_" + name)
-            getattr(self.data.efc, name).copy_(self.transfer.to_torch(value))
+            self._copy_to_mps(getattr(self.data.efc, name), value)
 
     def _run(self, mode):
         fields = self._fields()

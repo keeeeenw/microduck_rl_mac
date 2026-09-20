@@ -91,6 +91,13 @@ def _set(value, part, child):
 
 
 def restore(env, state):
+    if "native_physics" in state:
+        # Constraints can grow during a run. Resize before restoring tensor
+        # leaves, including checkpoints made by the older fixed-4096 bridge.
+        for path, kind, saved in state["leaves"]:
+            if path == (("attr", "sim"), ("attr", "_constraint_capacity")):
+                env.sim.ensure_constraint_capacity(saved, exact=True)
+                break
     for path, kind, saved in state["leaves"]:
         # Episode logging tensors change rank between reset and aggregation.
         # They are diagnostics, not continuation state.

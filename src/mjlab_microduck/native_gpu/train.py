@@ -141,6 +141,7 @@ def main():
             if (
                 native.get("schema") == 2
                 and native.get("physics_backend", "mps") == args.physics
+                and native.get("environment_layout") == "no-origin-markers-v1"
             ):
                 from .checkpoint import restore
 
@@ -214,6 +215,7 @@ def main():
 
             saved["native_gpu"] = {
                 "schema": 2,
+                "environment_layout": "no-origin-markers-v1",
                 "physics_backend": args.physics,
                 "environment": capture(env),
             }
