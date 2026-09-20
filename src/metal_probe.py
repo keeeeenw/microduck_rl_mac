@@ -32,75 +32,140 @@ class MetalSharedBufferProbe:
         self.mgr = MetalKernelManager(shader_path)
 
     def run_two_way_ordering_cycle(
-        self, num_envs: int = 64, n_dofs: int = 20, iterations: int = 10
+        self, num_envs: int = 64, n_dofs: int = 20, iterations: int = 5, test_mutation_omission: bool = False
     ) -> Dict[str, Any]:
-        """Execute a full two-way ordering cycle between Torch and Metal on MPS.
+        """Execute and verify full two-way ordering cycle with strict mathematical parity.
         
         Torch Producer -> Metal Kernel 1 -> Torch Transform -> Metal Kernel 2 -> Torch Consumer
+        Compares intermediate and final states, observations, actor outputs, and gradients
+        against an independent deterministic CPU reference.
         """
-        # Step 1: Torch Producer on MPS
-        qpos = torch.zeros((num_envs, n_dofs), device="mps", dtype=torch.float32)
-        qvel = torch.zeros((num_envs, n_dofs), device="mps", dtype=torch.float32)
-        ctrl = torch.ones((num_envs, n_dofs), device="mps", dtype=torch.float32) * 5.0
+        torch.manual_seed(42)
+        # Deterministic initial values
+        qpos_init = torch.randn((num_envs, n_dofs), dtype=torch.float32) * 0.1
+        qvel_init = torch.randn((num_envs, n_dofs), dtype=torch.float32) * 0.2
+        ctrl_init = torch.ones((num_envs, n_dofs), dtype=torch.float32) * 2.5
         dt = 0.005
         damping = 0.1
+        scale = 1.5
 
-        # MLP consumer
-        mlp = nn.Sequential(
+        # Seeded fixed weights for MLP
+        torch.manual_seed(123)
+        mlp_cpu = nn.Sequential(
+            nn.Linear(n_dofs, 64),
+            nn.Tanh(),
+            nn.Linear(64, 14)
+        )
+        
+        # Mirror exact weights to MPS model
+        mlp_mps = nn.Sequential(
             nn.Linear(n_dofs, 64),
             nn.Tanh(),
             nn.Linear(64, 14)
         ).to("mps")
+        mlp_mps.load_state_dict(mlp_cpu.state_dict())
+
+        # GPU tensors
+        qpos_mps = qpos_init.clone().to("mps")
+        qvel_mps = qvel_init.clone().to("mps")
+        ctrl_mps = ctrl_init.clone().to("mps")
+
+        # CPU reference tensors
+        qpos_ref = qpos_init.clone()
+        qvel_ref = qvel_init.clone()
+        ctrl_ref = ctrl_init.clone()
 
         total_threads = num_envs * n_dofs
-        step_outputs = []
+        step_errors = []
 
         for step in range(iterations):
-            # Step 2: Metal Kernel 1 (Integration mutation)
+            # --- GPU Path ---
+            # 1. Metal Kernel 1: substep integration
             self.mgr.launch(
                 "probe_substep_integrate",
-                qpos, qvel, ctrl, dt, damping,
+                qpos_mps, qvel_mps, ctrl_mps, dt, damping,
                 threads=total_threads
             )
 
-            # Step 3: Torch Transform on MPS (Elementwise trigonometric transformation)
-            obs = torch.sin(qpos) + torch.cos(qvel)
+            # 2. Torch Transform on MPS
+            obs_mps = torch.sin(qpos_mps) + torch.cos(qvel_mps)
 
-            # Step 4: Metal Kernel 2 (In-place scale mutation on the Torch transform)
-            scale = 1.5
-            self.mgr.launch(
-                "probe_inplace_scale",
-                obs, scale,
-                threads=total_threads
-            )
+            # 3. Metal Kernel 2: in-place scale mutation
+            if not test_mutation_omission:
+                self.mgr.launch(
+                    "probe_inplace_scale",
+                    obs_mps, scale,
+                    threads=total_threads
+                )
 
-            # Step 5: Torch MLP Consumer (Forward pass & loss)
-            actions = mlp(obs)
-            loss = actions.sum()
-            loss.backward()
-            mlp.zero_grad()
+            # 4. Torch Consumer on MPS (MLP forward and backward)
+            mlp_mps.zero_grad()
+            actions_mps = mlp_mps(obs_mps)
+            loss_mps = actions_mps.sum()
+            loss_mps.backward()
 
-        # Synchronize at the end of the entire loop for verification readback
-        torch.mps.synchronize()
+            # --- CPU Reference Path ---
+            # 1. Reference substep integration
+            v_ref = qvel_ref + (ctrl_ref - damping * qvel_ref) * dt
+            q_ref = qpos_ref + v_ref * dt
+            qvel_ref = v_ref
+            qpos_ref = q_ref
 
-        # Correctness readback strictly OUTSIDE the timed loop
-        final_qpos = qpos.detach().cpu()
-        final_qvel = qvel.detach().cpu()
-        final_obs = obs.detach().cpu()
+            # 2. Reference transform
+            obs_ref = torch.sin(qpos_ref) + torch.cos(qvel_ref)
 
-        assert not torch.isnan(final_qpos).any(), "NaN detected in qpos"
-        assert not torch.isnan(final_qvel).any(), "NaN detected in qvel"
-        assert not torch.isnan(final_obs).any(), "NaN detected in obs"
-        assert (final_qpos > 0.0).all(), "qpos should be positive after acceleration"
+            # 3. Reference scale mutation
+            obs_ref = obs_ref * scale
+
+            # 4. Reference MLP forward & backward
+            mlp_cpu.zero_grad()
+            actions_ref = mlp_cpu(obs_ref)
+            loss_ref = actions_ref.sum()
+            loss_ref.backward()
+
+            # Collect errors outside the pipeline
+            torch.mps.synchronize()
+            diff_qpos = (qpos_mps.cpu() - qpos_ref).abs().max().item()
+            diff_qvel = (qvel_mps.cpu() - qvel_ref).abs().max().item()
+            diff_obs = (obs_mps.cpu() - obs_ref).abs().max().item()
+            diff_actions = (actions_mps.cpu() - actions_ref).abs().max().item()
+            diff_grad = (mlp_mps[0].weight.grad.cpu() - mlp_cpu[0].weight.grad).abs().max().item()
+
+            step_errors.append({
+                "step": step,
+                "diff_qpos": diff_qpos,
+                "diff_qvel": diff_qvel,
+                "diff_obs": diff_obs,
+                "diff_actions": diff_actions,
+                "diff_grad": diff_grad,
+            })
+
+            if test_mutation_omission:
+                # Expect significant discrepancy if Metal mutation is omitted
+                assert diff_obs > 0.1, "Omission test failed: diff_obs should be large!"
+                return {
+                    "status": "omission_detected",
+                    "diff_obs": diff_obs,
+                    "diff_actions": diff_actions,
+                    "diff_grad": diff_grad,
+                }
+
+            assert diff_qpos < 1e-5, f"Step {step} qpos error {diff_qpos} exceeds tolerance 1e-5"
+            assert diff_qvel < 1e-5, f"Step {step} qvel error {diff_qvel} exceeds tolerance 1e-5"
+            assert diff_obs < 1e-5, f"Step {step} obs error {diff_obs} exceeds tolerance 1e-5"
+            assert diff_actions < 1e-5, f"Step {step} actions error {diff_actions} exceeds tolerance 1e-5"
+            assert diff_grad < 1e-4, f"Step {step} grad error {diff_grad} exceeds tolerance 1e-4"
 
         return {
             "status": "passed",
             "iterations": iterations,
             "num_envs": num_envs,
             "n_dofs": n_dofs,
-            "final_qpos_mean": float(final_qpos.mean()),
-            "final_qvel_mean": float(final_qvel.mean()),
-            "final_obs_mean": float(final_obs.mean()),
+            "max_qpos_error": max(e["diff_qpos"] for e in step_errors),
+            "max_qvel_error": max(e["diff_qvel"] for e in step_errors),
+            "max_obs_error": max(e["diff_obs"] for e in step_errors),
+            "max_actions_error": max(e["diff_actions"] for e in step_errors),
+            "max_grad_error": max(e["diff_grad"] for e in step_errors),
         }
 
     def test_slicing_and_offsets(self) -> Dict[str, Any]:

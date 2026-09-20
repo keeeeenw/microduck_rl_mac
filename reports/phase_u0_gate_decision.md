@@ -30,13 +30,13 @@
 
 | Evaluation Dimension | Route A: Torch MPS + Metal Physics | Route B: All JAX / MJX | Route C: All MLX |
 | --- | --- | --- | --- |
-| **Physics Fidelity & Integrator** | **High**: Port MuJoCo Warp's canonical `ImplicitFast` + Newton line-search solver directly to MSL | **High**: Existing MJX physics equations | **Low/Flawed**: MLX-Cpp batched path hardcodes Euler, simplified PGS, single-vertex contacts |
-| **Data Residency** | **Zero Staging**: PyTorch MPS owns all tensors; Metal shaders mutate device buffers directly | **Zero Staging**: All JAX arrays on MPS | **Zero Staging**: All MLX arrays on MPS |
-| **BAM Actuation & DR** | **Zero Porting**: Retain PyTorch `FrictionDRBamActuator` and DR managers unchanged | **High Effort**: Must port BAM M6 equations, voltage control, and delay ring buffers to JAX | **High Effort**: Must port BAM M6 and DR managers to MLX |
-| **Task Managers & Sensors** | **Zero Porting**: Retain all `mjlab` managers, terms, and curricula in PyTorch | **High Effort**: Must rewrite all rewards, terminations, and observations in JAX | **High Effort**: Must rewrite all rewards, terminations, and observations in MLX |
-| **PPO Learner & Rollouts** | **Zero Porting**: Existing PyTorch PPO learner, symmetry, and ONNX export preserved | **High Effort**: Must implement or port full PPO learner, GAE, and rollout storage to JAX | **High Effort**: Must implement or port full PPO learner, GAE, and rollout storage to MLX |
-| **Dispatch Overhead** | $\sim 2.7\ \mu\text{s}$ per kernel launch | Pinned PJRT dispatch latency | MLX stream dispatch latency |
-| **Total Engineering Estimate** | **3–4 engineer-weeks** (physics engine only) | **8–10 engineer-weeks** (BAM + managers + learner + export) | **10–12 engineer-weeks** (fix physics + BAM + managers + learner) |
+| **Physics Fidelity & Integrator** | **High Potential**: Port MuJoCo Warp's canonical `ImplicitFast` + Newton line-search solver directly to MSL | **Demonstrated**: Functioning MJX GPU physics | **Low/Flawed**: MLX-Cpp batched path hardcodes Euler, simplified PGS, single-vertex contacts |
+| **Data Residency** | **Zero Staging Potential**: PyTorch MPS owns all tensors; Metal shaders mutate device buffers directly | **Zero Staging**: All JAX arrays on MPS | **Zero Staging**: All MLX arrays on MPS |
+| **BAM Actuation & DR** | **Zero Porting**: Retain PyTorch `FrictionDRBamActuator` and DR managers unchanged | **Substantial**: Must port BAM M6 equations, voltage control, and delay ring buffers to JAX | **Substantial**: Must port BAM M6 and DR managers to MLX |
+| **Task Managers & Sensors** | **Zero Porting**: Retain all `mjlab` managers, terms, and curricula in PyTorch | **Substantial**: Must rewrite all rewards, terminations, and observations in JAX | **Substantial**: Must rewrite all rewards, terminations, and observations in MLX |
+| **PPO Learner & Rollouts** | **Zero Porting**: Existing PyTorch PPO learner, symmetry, and ONNX export preserved | **Substantial**: Must implement or port full PPO learner, GAE, and rollout storage to JAX | **Substantial**: Must implement or port full PPO learner, GAE, and rollout storage to MLX |
+| **Dispatch Latency (Synthetic)** | $\sim 2.6\text{ to }2.9\ \mu\text{s}$ per kernel launch | PJRT dispatch latency | MLX stream dispatch latency |
+| **Engineering Scope & Uncertainty** | **Bounded Physics Engine**: Build kinematics, dynamics, contact narrowphase & Newton solver. Uncertainty: solver iteration speed and contact robustness. | **Complete Rollout Rewrite**: Retain physics; rewrite BAM, task managers, rollouts, learner, and ONNX export. | **Full Stack Rewrite**: Fix flawed physics engine + port BAM + rewrite task managers + port learner. |
 
 ---
 
@@ -59,35 +59,30 @@ To build the qualified physics engine in Phase U1, the following concrete stages
 ### 3. Collision Detection & Contact Manifolds (`collision.metal`)
 - **Required**:
   - Conservative Broadphase: Bounding sphere rejection to discard definitely separated pairs.
-  - Narrowphase: Convex hull support functions and GJK algorithm for surviving candidate pairs.
-  - Penetration Depth & Normals: EPA (Expanding Polytope Algorithm) or analytical plane projection.
-  - Foot Contact Manifolds: 4-point contact manifold for sole/ground plane interaction (ensuring foot support polygon stability).
-  - Bounded Capacity & Overflow: Enforce `nconmax=35` with atomic contact counting and explicit overflow flagging.
+  - Narrowphase: Convex hull support functions and GJK/plane narrowphase for surviving candidate pairs.
+  - Foot Contact Manifolds: Multi-point contact manifold generation for sole/ground plane interaction (ensuring stable contact normals and support polygons).
+  - Bounded Capacity & Overflow Policy: Enforce `nconmax=35` with atomic contact counting. If contact count exceeds `nconmax`, set an overflow sentinel and fail/retry the step; NEVER silently truncate active contacts.
 - **Upstream Reference**: MuJoCo Warp `collision_convex.py`, `collision_gjk.py`, `collision_driver.py`.
 
-### 4. Constraint Jacobian & Pyramidal Cone (`constraints.metal`)
+### 4. Constraint Jacobian & Solver Equations (`solver.metal`)
 - **Required**:
-  - Compute contact Jacobians $J \in \mathbb{R}^{n_c \times 20}$.
-  - Assemble pyramidal friction cone constraints (4 facets per contact with $\mu=1.0$).
-  - Include joint limit constraints for the 14 actuated joints.
-- **Upstream Reference**: MuJoCo Warp `constraint.py`.
-
-### 5. Constraint Solver (`solver.metal`)
-- **Required**:
-  - Newton solver with line search (10 iterations, 20 line-search iterations, tolerance $10^{-8}$).
+  - Compute contact Jacobians $J \in \mathbb{R}^{n_c \times 20}$ and pyramidal friction cone constraints (4 facets per contact with randomized task friction $\mu$).
+  - Include joint limit constraints and BAM frictionloss constraints explicitly in the solver equation.
+  - Newton solver with line search (10 iterations, 20 line-search iterations, tolerance $10^{-8}$) solving:
+    $$(M - h \frac{\partial f}{\partial v}) \dot{v} + J^T \lambda + J_{limit}^T \lambda_{limit} + \tau_{friction} = \tau - c$$
   - $20 \times 20$ symmetric positive definite system factorization (Cholesky $L L^T$).
   - Warm start acceleration integration from previous step ($qacc\_warmstart$).
-- **Upstream Reference**: MuJoCo Warp `solver.py:solve_newton`, `solve_linesearch`.
+- **Upstream Reference**: MuJoCo Warp `solver.py:solve_newton`, `solve_linesearch`, `constraint.py`.
 
-### 6. Integrator: Canonical ImplicitFast (`integrator.metal`)
+### 5. Integrator: Canonical ImplicitFast & Quaternion Integration (`integrator.metal`)
 - **Required**:
-  - Velocity derivative correction $\frac{\partial f}{\partial v}$ added before factorization:
-    $$(M - h \frac{\partial f}{\partial v}) \dot{v} = \tau + \tau_{constraint} - c$$
+  - Velocity derivative correction $\frac{\partial f}{\partial v}$ evaluated via `derivative.deriv_smooth_vel` before factorization.
   - Velocity update: $v_{t+h} = v_t + h \dot{v}$.
-  - Quaternion integration for base orientation:
-    $$q_{t+h} = \text{normalize}\left(q_t + \frac{h}{2} (0, \omega) \otimes q_t\right)$$
+  - Quaternion integration matching MuJoCo Warp `math.py:189`:
+    $$\Delta \theta = \omega h, \quad \Delta q = \left(\cos\frac{\|\Delta \theta\|}{2}, \frac{\Delta \theta}{\|\Delta \theta\|} \sin\frac{\|\Delta \theta\|}{2}\right)$$
+    $$q_{t+h} = \text{normalize}\left(\text{mul\_quat}(q_t, \Delta q)\right) \quad (\text{exact right-multiplication})$$
   - Generalized position update: $q_{joint, t+h} = q_{joint, t} + h v_{joint}$.
-- **Upstream Reference**: MuJoCo Warp `forward.py:577`, `math.py:quat_integrate`.
+- **Upstream Reference**: MuJoCo Warp `forward.py:577`, `math.py:189`.
 
 ---
 

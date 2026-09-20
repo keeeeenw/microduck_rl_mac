@@ -9,9 +9,13 @@ Generated on 2026-09-20.
 
 ---
 
-## 1. Dispatch Overhead & Throughput Table
+## 1. Dispatch Overhead & Synthetic Loop Throughput Table
+*(Measured under concurrent load with background training PID 4632 active)*
 
-| Batch Size (`num_envs`) | CPU Submission / Kernel ($\mu$s) | GPU Event / Step (ms) | Wall Time / Step (ms) | Control SPS (50 Hz equiv) | Physics SPS (200 Hz equiv) |
+> [!CAUTION]
+> **Synthetic Loop Disclaimer**: The numbers below measure the submission and dispatch rate of a synthetic 5-stage loop on PyTorch MPS. They are **synthetic loop iterations per second**, NOT physical simulation steps or RL environment transitions per second. They must not be compared to training logs or full simulator throughput.
+
+| Batch Size (`num_envs`) | CPU Submission / Kernel ($\mu$s) | GPU Event / Step (ms) | Wall Time / Step (ms) | Synthetic Control Iterations/s | Synthetic Substep Iterations/s |
 | --- | --- | --- | --- | --- | --- |
 | 1 | 2.92 | 0.106 | 0.111 | 9,044.1 | 36,176.3 |
 | 8 | 2.72 | 0.112 | 0.114 | 8,810.2 | 35,240.9 |
@@ -40,7 +44,7 @@ Generated on 2026-09-20.
 
 ---
 
-## 3. Two-Way Ordering & Trace Evidence (Absence of Host Staging)
+## 3. Two-Way Ordering & Trace Evidence (Status of Zero-Copy Verification)
 
 A Chrome Trace capture was executed for the full bidirectional sequence:
 $$\text{Torch Producer (MPS)} \longrightarrow \text{Metal Kernel 1 (MPS)} \longrightarrow \text{Torch Transform (MPS)} \longrightarrow \text{Metal Kernel 2 (MPS)} \longrightarrow \text{Torch MLP Consumer (MPS)}$$
@@ -48,10 +52,11 @@ $$\text{Torch Producer (MPS)} \longrightarrow \text{Metal Kernel 1 (MPS)} \longr
 - **Trace Artifact Location**:
   - Local: `unified-metal/reports/two_way_ordering_trace.json`
   - Persistent T7 Storage: `/Volumes/T7/ChatGPOExtension/unified-metal/traces/two_way_ordering_trace.json`
-- **Trace Analysis Findings**:
-  1. **Zero Host Copy Operators**: The trace records 23 in-stream MPS operator events (`aten::sin`, `aten::cos`, `aten::add`). Exactly **0** `aten::copy_`, `aten::_to_copy`, or CPU transfer operators occurred.
-  2. **Zero Host Memory Allocations**: Host memory allocation events during the sequence = **0 Bytes**.
-  3. **Direct Mutation Visibility**: Output tensors from Metal kernels were directly read by subsequent PyTorch native MPS operators without intermediate synchronization or host round-trips.
+- **Trace Analysis & Verification Status**:
+  1. **CPU Dispatch Evidence**: The trace recorded **15 `cpu_op` events** (5 each of `aten::sin`, `aten::cos`, `aten::add`) and 7 metadata events. Exactly **0** `aten::copy_`, `aten::_to_copy`, or CPU memory transfer operators occurred.
+  2. **In-Process Pointer Identity Verified**: Memory addresses (`tensor.data_ptr()`) remain identical across PyTorch and custom Metal kernel invocations.
+  3. **Device-Level Metal GPU Trace**: **Partially Complete / Pending Instrumentation**. Full hardware-level timeline tracing requires the Metal capture layer (`MTL_CAPTURE_ENABLED=1` injected via Xcode or `metal-trace`), as the PyTorch CPU profiler does not observe GPU command buffers directly. Zero host staging is established at the Python/C++ framework dispatch level, while hardware blit verification remains pending external GPU trace capture.
+  4. **Strict Numerical Parity**: The full pipeline matches an independent deterministic CPU reference to within float32 precision ($< 10^{-5}$ across positions, velocities, observations, MLP outputs, and gradients), and omission of an intermediate Metal mutation immediately triggers a detectable divergence ($> 0.1$).
 
 ---
 
