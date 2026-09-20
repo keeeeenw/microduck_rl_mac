@@ -1,13 +1,16 @@
-# Microduck RL on Mac
+# Microduck RL — Native Apple GPU Training
 
-Native Apple Silicon GPU simulation and reinforcement learning for
-[Microduck](https://github.com/pollen-robotics/microduck), built on the
+**Native Apple GPU support for physics simulation and RL training** on Apple Silicon Macs.
+For [Microduck](https://github.com/pollen-robotics/microduck), using the
 [Microduck RL](https://github.com/pollen-robotics/microduck_rl) environments and
 [mjlab](https://github.com/mujocolab/mjlab).
 
 The goal is to train locally on a Mac and deploy the same exported policy on a
 Linux machine. Native GPU acceleration is the priority; CPU execution is used for
-reference checks and validation where needed.
+reference checks and validation where needed. The experimental flat-terrain path
+runs physics, BAM actuation, policy rollouts and PPO updates on the Apple GPU.
+The initial 64-environment smoke test was validated on an **M1 Max with 32 GB
+of unified memory**. Learning quality and throughput remain under evaluation.
 
 Community support and pull requests are welcome. Reproducible bug reports,
 Apple Silicon test results, performance improvements and Linux validation all
@@ -39,3 +42,7 @@ help move the project forward.
 - A successful training smoke test does not establish walking quality, simulation
   equivalence across backends or readiness for physical robot deployment.
 - Full Mac runtime, visualization and peripheral support is still in progress.
+
+Licensed under [Apache License 2.0](LICENSE), the same license as the original
+[Microduck RL project](https://github.com/pollen-robotics/microduck_rl/blob/develop/LICENSE).
+Upstream license and attribution notices are retained.
