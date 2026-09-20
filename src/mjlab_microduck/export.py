@@ -249,24 +249,7 @@ def run_export(task_id: str, cfg: ExportConfig) -> ExportResult:
         runner.load(str(resume_path), map_location=device)
         policy = runner.get_inference_policy(device=device)
 
-    # mjlab 1.3.0: ONNX export + metadata moved to mjlab.rl.exporter_utils and
-    # the runner's built-in export_policy_to_onnx. Observation normalization is
-    # baked into the exported graph automatically — EmpiricalNormalization is a
-    # submodule of the policy's MLPModel (obs_normalization=True in RslRlModelCfg),
-    # so export_policy_to_onnx emits actor(normalizer(obs)). No manual normalizer
-    # handling needed (the old export_velocity_policy_as_onnx path is gone).
-    from mjlab.rl.exporter_utils import get_base_metadata, attach_metadata_to_onnx
-
-    onnx_path = os.path.abspath(cfg.onnx_file)
-    path = os.path.dirname(onnx_path)
-    filename = os.path.basename(onnx_path)
-
-    runner.export_policy_to_onnx(path, filename)
-
-    metadata = get_base_metadata(runner.env.unwrapped, run_path=cfg.checkpoint_file)
-    attach_metadata_to_onnx(onnx_path, metadata)
-
-    print(f"Written {onnx_path}")
+    onnx_path = export_runner_policy(runner, cfg.onnx_file, cfg.checkpoint_file)
 
     env.close()
     return ExportResult(
@@ -275,6 +258,21 @@ def run_export(task_id: str, cfg: ExportConfig) -> ExportResult:
         wandb_run_path=cfg.wandb_run_path,
         checkpoint_iteration=_iteration_of(resume_path),
     )
+
+
+def export_runner_policy(runner, onnx_file: str, checkpoint_file: str | None = None) -> Path:
+    """Export an already constructed runner through the canonical normalized path.
+
+    Native training can use this without constructing a second physics backend.
+    """
+    from mjlab.rl.exporter_utils import get_base_metadata, attach_metadata_to_onnx
+
+    onnx_path = Path(onnx_file).resolve()
+    runner.export_policy_to_onnx(str(onnx_path.parent), onnx_path.name)
+    metadata = get_base_metadata(runner.env.unwrapped, run_path=checkpoint_file)
+    attach_metadata_to_onnx(str(onnx_path), metadata)
+    print(f"Written {onnx_path}")
+    return onnx_path
 
 
 def main():
