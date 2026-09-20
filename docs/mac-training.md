@@ -4,6 +4,14 @@ Requires a native Apple Silicon Python 3.12 environment and access to Metal.
 The current entry point runs `Mjlab-Velocity-Flat-MicroDuck`; rough terrain is
 not yet supported by this adapter. Run from the repository root with a recent uv.
 
+**Validation hardware: Apple M1 Max with 32 GB of unified memory (24-core GPU).**
+The training parameters below—64 parallel environments, 24 rollout steps per
+PPO update, five smoke-test updates, and a checkpoint every update—were validated
+on this machine with native Apple GPU execution. Checkpoint resume and ONNX
+export comparison also passed. These results do not establish performance or
+memory requirements for other Mac configurations, larger environment counts,
+rough terrain, or learned walking quality.
+
 ```bash
 uv sync --locked --extra mac-gpu --python 3.12
 uv run --locked --extra mac-gpu python -m mjlab_microduck.native_gpu.train \
@@ -24,6 +32,10 @@ uv run --locked --extra mac-gpu python -m mjlab_microduck.native_gpu.train \
   --resume logs/native-gpu/smoke/model_4.pt \
   --log-dir logs/native-gpu/continued
 ```
+
+The 1,000-update continuation above was started on the same M1 Max with 32 GB
+of unified memory. Its initial updates and checkpoints were verified; completion
+of the full campaign and policy quality have not yet been validated.
 
 `--iterations` counts additional PPO updates. The run saves checkpoints after its
 first update, at the requested interval, and on normal completion. Checkpoints
