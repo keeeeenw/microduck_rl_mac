@@ -94,3 +94,47 @@ def test_end_to_end_gpu_slice_parity(slice_engine):
 def test_contact_overflow_safety(slice_engine):
     """Verifies that restricting nconmax trips the overflow flag without corrupted writes."""
     assert slice_engine.test_overflow_safety() is True
+
+
+def test_heterogeneous_batch_shortcut_eliminated(slice_engine):
+    """Regression test: verifies that equal endpoint qpos with different qvel and distinct middle row
+
+    are processed completely independently without any endpoint-broadcasting shortcut.
+    """
+    states = get_canonical_states(slice_engine.canonical)
+    qpos_std, qvel_zero = states["standing"]
+    qpos_single, qvel_single = states["single_support"]
+
+    # World 2 has identical qpos to World 0, but distinct moving qvel
+    qvel_mov = np.zeros(slice_engine.m.nv, dtype=np.float64)
+    qvel_mov[3:6] = [2.0, -1.5, 3.0]
+    qvel_mov[6:12] = [2.0, 2.0, 2.0, 2.0, 2.0, 2.0]
+
+    qpos_batch = torch.from_numpy(np.stack([qpos_std, qpos_single, qpos_std]).astype(np.float32)).to(slice_engine.device)
+    qvel_batch = torch.from_numpy(np.stack([qvel_zero, qvel_single, qvel_mov]).astype(np.float32)).to(slice_engine.device)
+
+    engine_b3 = RepresentativePhysicsSlice(batch_size=3, canonical=slice_engine.canonical)
+    out = engine_b3.forward(qpos_batch, qvel_batch)
+    torch.mps.synchronize()
+
+    # 1. World 0 and World 2 have identical qpos but different qvel -> bias forces MUST differ
+    bias_diff_0_2 = torch.norm(out.qfrc_bias[0] - out.qfrc_bias[2]).item()
+    assert bias_diff_0_2 > 0.10, f"Expected distinct bias forces for different qvel, diff={bias_diff_0_2}"
+
+    # 2. World 1 is distinct in the middle -> mass matrix MUST differ from World 0 and 2
+    M_diff_0_1 = torch.norm(out.M_eff[0] - out.M_eff[1]).item()
+    assert M_diff_0_1 > 0.01, f"Expected distinct mass matrix for single support in middle row, diff={M_diff_0_1}"
+
+    # 3. Verify each row matches independent single-world evaluations
+    engine_b1 = RepresentativePhysicsSlice(batch_size=1, canonical=slice_engine.canonical)
+    for b, (qp, qv) in enumerate([(qpos_std, qvel_zero), (qpos_single, qvel_single), (qpos_std, qvel_mov)]):
+        qp_t = torch.from_numpy(qp.astype(np.float32)).unsqueeze(0).to(slice_engine.device)
+        qv_t = torch.from_numpy(qv.astype(np.float32)).unsqueeze(0).to(slice_engine.device)
+        out_single = engine_b1.forward(qp_t, qv_t)
+        torch.mps.synchronize()
+
+        err_M = torch.max(torch.abs(out.M_eff[b] - out_single.M_eff[0])).item()
+        err_bias = torch.max(torch.abs(out.qfrc_bias[b] - out_single.qfrc_bias[0])).item()
+        assert err_M < 1e-5, f"Batch row {b} M differs from single-world evaluation: {err_M}"
+        assert err_bias < 1e-5, f"Batch row {b} bias differs from single-world evaluation: {err_bias}"
+

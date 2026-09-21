@@ -33,9 +33,19 @@ class BodyConstants(ctypes.Structure):
         ("dof_adr", ctypes.c_int32),
         ("body_pos", ctypes.c_float * 3),
         ("body_quat", ctypes.c_float * 4),
+        ("body_ipos", ctypes.c_float * 3),
+        ("body_iquat", ctypes.c_float * 4),
         ("jnt_axis", ctypes.c_float * 3),
         ("mass", ctypes.c_float),
         ("inertia", ctypes.c_float * 3),
+    ]
+
+
+class DofConstants(ctypes.Structure):
+    _fields_ = [
+        ("dof_parentid", ctypes.c_int32),
+        ("dof_bodyid", ctypes.c_int32),
+        ("dof_armature", ctypes.c_float),
     ]
 
 
@@ -51,6 +61,9 @@ class GeomConstants(ctypes.Structure):
 class PhysicsSliceOutputs:
     body_xpos: torch.Tensor       # (B, 17, 3)
     body_xmat: torch.Tensor       # (B, 17, 9)
+    body_xipos: torch.Tensor      # (B, 17, 3)
+    body_ximat: torch.Tensor      # (B, 17, 9)
+    subtree_com: torch.Tensor     # (B, 3)
     geom_xpos: torch.Tensor       # (B, 2, 3)
     geom_xmat: torch.Tensor       # (B, 2, 9)
     contact_pos: torch.Tensor     # (B, nconmax, 3)
@@ -60,9 +73,12 @@ class PhysicsSliceOutputs:
     ncon: torch.Tensor            # (B,) int32
     overflow_flag: torch.Tensor   # (B,) int32
     M_eff: torch.Tensor           # (B, 20, 20)
+    L_factor: torch.Tensor        # (B, 20, 20)
+    M_inv: torch.Tensor           # (B, 20, 20)
     qfrc_bias: torch.Tensor       # (B, 20)
     qfrc_constraint: torch.Tensor # (B, 20)
     qacc: torch.Tensor            # (B, 20)
+    solver_status: torch.Tensor   # (B,) int32
 
 
 class RepresentativePhysicsSlice:
@@ -112,12 +128,23 @@ class RepresentativePhysicsSlice:
 
             for k in range(3):
                 bodies_array[i].body_pos[k] = float(m.body_pos[i, k])
+                bodies_array[i].body_ipos[k] = float(m.body_ipos[i, k])
                 bodies_array[i].inertia[k] = float(m.body_inertia[i, k])
             for k in range(4):
                 bodies_array[i].body_quat[k] = float(m.body_quat[i, k])
+                bodies_array[i].body_iquat[k] = float(m.body_iquat[i, k])
             bodies_array[i].mass = float(m.body_mass[i])
 
         self.bodies_buf = torch.frombuffer(bodies_array, dtype=torch.uint8).to(self.device)
+
+        # 20 DOFs
+        dofs_array = (DofConstants * 20)()
+        for d in range(20):
+            dofs_array[d].dof_parentid = int(m.dof_parentid[d])
+            dofs_array[d].dof_bodyid = int(m.dof_bodyid[d])
+            dofs_array[d].dof_armature = float(m.dof_armature[d])
+
+        self.dofs_buf = torch.frombuffer(dofs_array, dtype=torch.uint8).to(self.device)
 
         # 2 foot geoms
         geoms_array = (GeomConstants * 2)()
@@ -145,6 +172,10 @@ class RepresentativePhysicsSlice:
 
         self.body_xpos = torch.zeros((B, 17, 3), dtype=torch.float32, device=dev)
         self.body_xmat = torch.zeros((B, 17, 9), dtype=torch.float32, device=dev)
+        self.body_xipos = torch.zeros((B, 17, 3), dtype=torch.float32, device=dev)
+        self.body_ximat = torch.zeros((B, 17, 9), dtype=torch.float32, device=dev)
+        self.subtree_com = torch.zeros((B, 3), dtype=torch.float32, device=dev)
+
         self.geom_xpos = torch.zeros((B, 2, 3), dtype=torch.float32, device=dev)
         self.geom_xmat = torch.zeros((B, 2, 9), dtype=torch.float32, device=dev)
 
@@ -156,24 +187,132 @@ class RepresentativePhysicsSlice:
         self.overflow_flag = torch.zeros((B,), dtype=torch.int32, device=dev)
 
         self.M_eff = torch.zeros((B, 20, 20), dtype=torch.float32, device=dev)
+        self.L_factor = torch.zeros((B, 20, 20), dtype=torch.float32, device=dev)
         self.M_inv = torch.zeros((B, 20, 20), dtype=torch.float32, device=dev)
         self.qfrc_bias = torch.zeros((B, 20), dtype=torch.float32, device=dev)
+        self.solver_status = torch.zeros((B,), dtype=torch.int32, device=dev)
+
         self.qacc = torch.zeros((B, 20), dtype=torch.float32, device=dev)
         self.qfrc_constraint = torch.zeros((B, 20), dtype=torch.float32, device=dev)
+
+        # Pre-allocated identity matrix for native Cholesky inversion
+        eye = torch.eye(20, dtype=torch.float32, device=dev).unsqueeze(0).expand(B, -1, -1).contiguous()
+        self.eye_20 = eye
+
+        # Dummy per-world buffers for unperturbed runs
+        self.dummy_mass = torch.zeros((B, 17), dtype=torch.float32, device=dev)
+        self.dummy_ipos = torch.zeros((B, 17, 3), dtype=torch.float32, device=dev)
+        self.dummy_armature = torch.zeros((B, 20), dtype=torch.float32, device=dev)
+
+    def compute_native_dynamics(
+        self,
+        qpos: torch.Tensor,
+        qvel: torch.Tensor,
+        per_world_mass: Optional[torch.Tensor] = None,
+        per_world_ipos: Optional[torch.Tensor] = None,
+        per_world_armature: Optional[torch.Tensor] = None,
+    ):
+        """Computes native articulated dynamics (kinematics, CRBA mass matrix, RNE bias forces)
+
+        directly on MPS tensors via Metal kernel without host round-trips.
+        """
+        B = qpos.shape[0]
+        flags = 0
+        buf_mass = self.dummy_mass
+        buf_ipos = self.dummy_ipos
+        buf_armature = self.dummy_armature
+
+        if per_world_mass is not None:
+            flags |= 1
+            buf_mass = per_world_mass
+        if per_world_ipos is not None:
+            flags |= 2
+            buf_ipos = per_world_ipos
+        if per_world_armature is not None:
+            flags |= 4
+            buf_armature = per_world_armature
+
+        self.km.launch(
+            "kernel_articulated_dynamics",
+            self.bodies_buf,
+            self.dofs_buf,
+            qpos,
+            qvel,
+            buf_mass,
+            buf_ipos,
+            buf_armature,
+            int(flags),
+            self.M_eff,
+            self.qfrc_bias,
+            self.body_xpos,
+            self.body_xmat,
+            self.body_xipos,
+            self.body_ximat,
+            self.subtree_com,
+            threads=B,
+        )
+
+    def compute_native_cholesky_solve(
+        self,
+        M: torch.Tensor,
+        B_mat: torch.Tensor,
+        X_out: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Solves M X = B natively on GPU via Cholesky factorization and forward/back substitution.
+
+        Args:
+            M: (B, 20, 20) float32 symmetric positive-definite matrix
+            B_mat: (B, 20, K) float32 right-hand side matrix
+            X_out: optional pre-allocated output buffer (B, 20, K)
+        Returns:
+            (X, status): solution tensor and integer status tensor (0 for success, -1 for failure)
+        """
+        B = M.shape[0]
+        if B_mat.ndim == 2 and B_mat.shape[1] == 20:
+            B_mat_3d = B_mat.unsqueeze(2)
+            K = 1
+        elif B_mat.ndim == 3:
+            B_mat_3d = B_mat
+            K = B_mat.shape[2]
+        else:
+            raise ValueError(f"Unsupported B_mat shape {B_mat.shape}")
+
+        if X_out is None:
+            X_out = torch.zeros((B, 20, K), dtype=torch.float32, device=self.device)
+
+        self.km.launch(
+            "kernel_cholesky_solve",
+            M,
+            B_mat_3d,
+            int(K),
+            self.L_factor,
+            X_out,
+            self.solver_status,
+            threads=B,
+        )
+
+        return X_out, self.solver_status
+
+    def compute_native_M_inv(self):
+        """Inverts M_eff natively on GPU via Cholesky solve M_eff * M_inv = I_20 without LAPACK fallback."""
+        self.compute_native_cholesky_solve(self.M_eff, self.eye_20, self.M_inv)
 
     def forward(
         self,
         qpos: torch.Tensor,
         qvel: torch.Tensor,
         friction_coef: float = 1.0,
+        per_world_mass: Optional[torch.Tensor] = None,
+        per_world_ipos: Optional[torch.Tensor] = None,
+        per_world_armature: Optional[torch.Tensor] = None,
     ) -> PhysicsSliceOutputs:
-        """Executes one static-state physics slice on GPU without host staging."""
+        """Executes one static-state physics slice completely on GPU without host staging."""
         B = qpos.shape[0]
         if B != self.batch_size:
             self.batch_size = B
             self._init_persistent_buffers()
 
-        # 1. Forward Kinematics Kernel
+        # 1. Forward Kinematics for Foot Geoms
         self.km.launch(
             "kernel_forward_kinematics",
             self.bodies_buf,
@@ -186,7 +325,19 @@ class RepresentativePhysicsSlice:
             threads=B,
         )
 
-        # 2. CAD Contact Manifold Kernel
+        # 2. Native Articulated Dynamics (CRBA M_eff + RNE qfrc_bias)
+        self.compute_native_dynamics(
+            qpos,
+            qvel,
+            per_world_mass=per_world_mass,
+            per_world_ipos=per_world_ipos,
+            per_world_armature=per_world_armature,
+        )
+
+        # 3. Native Cholesky Inversion of M_eff on GPU (M_eff * M_inv = I_20)
+        self.compute_native_M_inv()
+
+        # 4. CAD Contact Manifold Kernel
         self.km.launch(
             "kernel_cad_contact_manifold",
             self.geom_xpos,
@@ -205,10 +356,7 @@ class RepresentativePhysicsSlice:
             threads=B,
         )
 
-        # 3. Articulated Dynamics (M_eff and qfrc_bias)
-        self._compute_dynamics_mps(qpos, qvel)
-
-        # 4. Constrained Solve Kernel
+        # 5. Constrained Solve Kernel
         self.km.launch(
             "kernel_constrained_solve",
             self.M_inv,
@@ -231,6 +379,9 @@ class RepresentativePhysicsSlice:
         return PhysicsSliceOutputs(
             body_xpos=self.body_xpos,
             body_xmat=self.body_xmat,
+            body_xipos=self.body_xipos,
+            body_ximat=self.body_ximat,
+            subtree_com=self.subtree_com,
             geom_xpos=self.geom_xpos,
             geom_xmat=self.geom_xmat,
             contact_pos=self.contact_pos,
@@ -240,54 +391,13 @@ class RepresentativePhysicsSlice:
             ncon=self.ncon,
             overflow_flag=self.overflow_flag,
             M_eff=self.M_eff,
+            L_factor=self.L_factor,
+            M_inv=self.M_inv,
             qfrc_bias=self.qfrc_bias,
             qfrc_constraint=self.qfrc_constraint,
             qacc=self.qacc,
+            solver_status=self.solver_status,
         )
-
-    def _compute_dynamics_mps(self, qpos: torch.Tensor, qvel: torch.Tensor):
-        """Computes M_eff and qfrc_bias, then factorizes/inverts M_eff on MPS."""
-        B = qpos.shape[0]
-        qpos_cpu = qpos.cpu().numpy()
-        qvel_cpu = qvel.cpu().numpy()
-
-        # Fast path if batch rows are identical (as during batched benchmarking)
-        if B > 1 and torch.all(qpos[0] == qpos[-1]):
-            d = mujoco.MjData(self.m)
-            M_buf = np.zeros((20, 20), dtype=np.float64)
-            d.qpos[:] = qpos_cpu[0]
-            d.qvel[:] = qvel_cpu[0]
-            mujoco.mj_forward(self.m, d)
-            mujoco.mj_fullM(self.m, d, M_buf)
-
-            M_single = torch.from_numpy(M_buf.astype(np.float32)).to(self.device)
-            bias_single = torch.from_numpy(d.qfrc_bias.astype(np.float32)).to(self.device)
-
-            self.M_eff.copy_(M_single.unsqueeze(0).expand(B, -1, -1))
-            self.qfrc_bias.copy_(bias_single.unsqueeze(0).expand(B, -1))
-        else:
-            M_list = []
-            bias_list = []
-            d = mujoco.MjData(self.m)
-            M_buf = np.zeros((20, 20), dtype=np.float64)
-
-            for b in range(B):
-                d.qpos[:] = qpos_cpu[b]
-                d.qvel[:] = qvel_cpu[b]
-                mujoco.mj_forward(self.m, d)
-                mujoco.mj_fullM(self.m, d, M_buf)
-
-                M_list.append(M_buf.copy())
-                bias_list.append(d.qfrc_bias.copy())
-
-            M_tensor = torch.from_numpy(np.stack(M_list).astype(np.float32)).to(self.device)
-            bias_tensor = torch.from_numpy(np.stack(bias_list).astype(np.float32)).to(self.device)
-
-            self.M_eff.copy_(M_tensor)
-            self.qfrc_bias.copy_(bias_tensor)
-
-        # Invert M_eff on MPS
-        self.M_inv.copy_(torch.linalg.inv(self.M_eff))
 
     def verify_state(self, state_name: str) -> Dict[str, float]:
         """Runs the static physics slice on a canonical state and validates parity vs CPU MuJoCo."""
@@ -357,8 +467,8 @@ class RepresentativePhysicsSlice:
             "overflow": overflow_gpu,
         }
 
-    def verify_solver_canonical_manifold(self, state_name: str) -> Dict[str, float]:
-        """Tests constraint solver equations on identical contact vertices to verify < 0.1 N parity."""
+    def verify_cpu_solver_reference(self, state_name: str) -> Dict[str, float]:
+        """Diagnostic: Tests CPU constraint solver equations on identical contact vertices (not GPU solver qualification)."""
         states = get_canonical_states(self.canonical)
         if state_name not in states:
             raise KeyError(f"Unknown state: {state_name}")
@@ -441,6 +551,9 @@ class RepresentativePhysicsSlice:
             "err_force": err_force,
             "err_acc": err_acc,
         }
+
+    # Backwards-compatible alias explicitly noting it is a CPU equation diagnostic
+    verify_solver_canonical_manifold = verify_cpu_solver_reference
 
     def benchmark_completed_work(
         self,

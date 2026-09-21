@@ -12,9 +12,17 @@ struct BodyConstants {
     int dof_adr;
     packed_float3 body_pos;
     packed_float4 body_quat;
+    packed_float3 body_ipos;
+    packed_float4 body_iquat;
     packed_float3 jnt_axis;
     float mass;
     packed_float3 inertia;
+};
+
+struct DofConstants {
+    int dof_parentid;
+    int dof_bodyid;
+    float dof_armature;
 };
 
 struct GeomConstants {
@@ -22,6 +30,73 @@ struct GeomConstants {
     packed_float3 geom_pos;
     packed_float4 geom_quat;
 };
+
+struct vec10 {
+    float Ixx, Iyy, Izz;
+    float Ixy, Ixz, Iyz;
+    float mx, my, mz;
+    float m;
+};
+
+inline vec10 crb_add(vec10 a, vec10 b) {
+    vec10 r;
+    r.Ixx = a.Ixx + b.Ixx;
+    r.Iyy = a.Iyy + b.Iyy;
+    r.Izz = a.Izz + b.Izz;
+    r.Ixy = a.Ixy + b.Ixy;
+    r.Ixz = a.Ixz + b.Ixz;
+    r.Iyz = a.Iyz + b.Iyz;
+    r.mx = a.mx + b.mx;
+    r.my = a.my + b.my;
+    r.mz = a.mz + b.mz;
+    r.m = a.m + b.m;
+    return r;
+}
+
+struct spatial_vec {
+    float3 w; // angular
+    float3 v; // linear
+
+    spatial_vec() : w(float3(0)), v(float3(0)) {}
+    spatial_vec(float3 w_, float3 v_) : w(w_), v(v_) {}
+};
+
+inline spatial_vec operator+(spatial_vec a, spatial_vec b) {
+    return spatial_vec(a.w + b.w, a.v + b.v);
+}
+
+inline spatial_vec operator*(spatial_vec a, float s) {
+    return spatial_vec(a.w * s, a.v * s);
+}
+
+inline float spatial_dot(spatial_vec a, spatial_vec b) {
+    return dot(a.w, b.w) + dot(a.v, b.v);
+}
+
+inline spatial_vec inert_vec(vec10 i, spatial_vec v) {
+    spatial_vec res;
+    res.w.x = i.Ixx * v.w.x + i.Ixy * v.w.y + i.Ixz * v.w.z - i.mz * v.v.y + i.my * v.v.z;
+    res.w.y = i.Ixy * v.w.x + i.Iyy * v.w.y + i.Iyz * v.w.z + i.mz * v.v.x - i.mx * v.v.z;
+    res.w.z = i.Ixz * v.w.x + i.Iyz * v.w.y + i.Izz * v.w.z - i.my * v.v.x + i.mx * v.v.y;
+    res.v.x = i.mz * v.w.y - i.my * v.w.z + i.m * v.v.x;
+    res.v.y = i.mx * v.w.z - i.mz * v.w.x + i.m * v.v.y;
+    res.v.z = i.my * v.w.x - i.mx * v.w.y + i.m * v.v.z;
+    return res;
+}
+
+inline spatial_vec motion_cross(spatial_vec u, spatial_vec v) {
+    spatial_vec res;
+    res.w = cross(u.w, v.w);
+    res.v = cross(u.v, v.w) + cross(u.w, v.v);
+    return res;
+}
+
+inline spatial_vec motion_cross_force(spatial_vec v, spatial_vec f) {
+    spatial_vec res;
+    res.w = cross(v.w, f.w) + cross(v.v, f.v);
+    res.v = cross(v.w, f.v);
+    return res;
+}
 
 // -----------------------------------------------------------------------------
 // Math helper functions
@@ -144,6 +219,279 @@ kernel void kernel_forward_kinematics(
         for (int r = 0; r < 3; ++r) {
             for (int c = 0; c < 3; ++c) {
                 g_xmat[g * 9 + r * 3 + c] = m[c][r]; // row r, col c
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// 1b. Native Articulated Dynamics Kernel (CRBA + RNE + Per-World Randomization)
+// -----------------------------------------------------------------------------
+
+kernel void kernel_articulated_dynamics(
+    constant BodyConstants* bodies [[buffer(0)]],        // 17 bodies
+    constant DofConstants* dofs [[buffer(1)]],           // 20 dofs
+    device const float* qpos_batch [[buffer(2)]],        // (B, 21)
+    device const float* qvel_batch [[buffer(3)]],        // (B, 20)
+    device const float* per_world_mass [[buffer(4)]],    // (B, 17) optional
+    device const float* per_world_ipos [[buffer(5)]],    // (B, 17, 3) optional
+    device const float* per_world_armature [[buffer(6)]],// (B, 20) optional
+    constant int& flags [[buffer(7)]],                   // bit 0: mass, bit 1: ipos, bit 2: armature
+    device float* M_eff_out [[buffer(8)]],               // (B, 20, 20)
+    device float* qfrc_bias_out [[buffer(9)]],           // (B, 20)
+    device float* xpos_out [[buffer(10)]],               // (B, 17, 3)
+    device float* xmat_out [[buffer(11)]],               // (B, 17, 9) row-major
+    device float* xipos_out [[buffer(12)]],              // (B, 17, 3)
+    device float* ximat_out [[buffer(13)]],              // (B, 17, 9) row-major
+    device float* subtree_com_out [[buffer(14)]],        // (B, 3)
+    uint tid [[thread_position_in_grid]]
+) {
+    uint b_idx = tid;
+    device const float* qpos = qpos_batch + b_idx * 21;
+    device const float* qvel = qvel_batch + b_idx * 20;
+    device float* M_out = M_eff_out + b_idx * 400;
+    device float* bias_out = qfrc_bias_out + b_idx * 20;
+
+    // Per-world parameters
+    float mass[17];
+    float3 ipos[17];
+    float armature[20];
+
+    for (int i = 0; i < 17; ++i) {
+        mass[i] = (flags & 1) ? per_world_mass[b_idx * 17 + i] : bodies[i].mass;
+        if (flags & 2) {
+            ipos[i] = float3(
+                per_world_ipos[(b_idx * 17 + i) * 3 + 0],
+                per_world_ipos[(b_idx * 17 + i) * 3 + 1],
+                per_world_ipos[(b_idx * 17 + i) * 3 + 2]
+            );
+        } else {
+            ipos[i] = float3(bodies[i].body_ipos);
+        }
+    }
+    for (int d = 0; d < 20; ++d) {
+        armature[d] = (flags & 4) ? per_world_armature[b_idx * 20 + d] : dofs[d].dof_armature;
+    }
+
+    // Kinematics arrays
+    float3 xpos[17];
+    float4 xquat[17];
+    float3x3 xmat[17];
+    float3 xipos[17];
+    float3x3 ximat[17];
+    float3 xaxis[20];
+    float3 xanchor[20];
+
+    xpos[0] = float3(0.0f);
+    xquat[0] = float4(1.0f, 0.0f, 0.0f, 0.0f);
+    xmat[0] = float3x3(1.0f);
+    xipos[0] = float3(0.0f);
+    ximat[0] = float3x3(1.0f);
+
+    xpos[1] = float3(0.0f);
+    xquat[1] = float4(1.0f, 0.0f, 0.0f, 0.0f);
+    xmat[1] = float3x3(1.0f);
+    xipos[1] = float3(0.0f);
+    ximat[1] = float3x3(1.0f);
+
+    // Body 2 (trunk_base, freejoint)
+    xpos[2] = float3(qpos[0], qpos[1], qpos[2]);
+    xquat[2] = normalize(float4(qpos[3], qpos[4], qpos[5], qpos[6]));
+    xmat[2] = quat_to_mat(xquat[2]);
+    xipos[2] = xpos[2] + quat_rot(xquat[2], ipos[2]);
+    ximat[2] = quat_to_mat(normalize(quat_mul(xquat[2], float4(bodies[2].body_iquat))));
+
+    for (int k = 0; k < 6; ++k) {
+        xanchor[k] = xpos[2];
+    }
+
+    // Bodies 3..16 (topological order)
+    for (int i = 3; i < 17; ++i) {
+        int pid = bodies[i].parent_id;
+        float3 pos_rel = float3(bodies[i].body_pos);
+        float4 quat_rel = float4(bodies[i].body_quat);
+        float3 axis = float3(bodies[i].jnt_axis);
+        int qadr = bodies[i].qpos_adr;
+        int dof = bodies[i].dof_adr;
+        float angle = qpos[qadr];
+
+        float half_a = angle * 0.5f;
+        float4 q_jnt = float4(cos(half_a), axis * sin(half_a));
+        float4 q_b = quat_mul(quat_rel, q_jnt);
+
+        xquat[i] = normalize(quat_mul(xquat[pid], q_b));
+        xanchor[dof] = xpos[pid] + quat_rot(xquat[pid], pos_rel);
+        xpos[i] = xanchor[dof]; // jnt_pos = 0
+        xmat[i] = quat_to_mat(xquat[i]);
+        xipos[i] = xpos[i] + quat_rot(xquat[i], ipos[i]);
+        ximat[i] = quat_to_mat(normalize(quat_mul(xquat[i], float4(bodies[i].body_iquat))));
+        xaxis[dof] = quat_rot(xquat[i], axis);
+    }
+
+    // Subtree Center of Mass (robot root is body 2)
+    float tot_mass = 0.0f;
+    float3 com_num = float3(0.0f);
+    for (int i = 2; i < 17; ++i) {
+        tot_mass += mass[i];
+        com_num += mass[i] * xipos[i];
+    }
+    float3 subtree_com = (tot_mass > 0.0f) ? (com_num / tot_mass) : float3(0.0f);
+
+    // Spatial Inertias (cinert) in subtree CoM frame
+    vec10 cinert[17];
+    for (int i = 2; i < 17; ++i) {
+        float3 dif = xipos[i] - subtree_com;
+        float3x3 mat = ximat[i];
+        float3 inert = float3(bodies[i].inertia);
+        float3x3 diag_inert = float3x3(
+            float3(inert.x, 0, 0),
+            float3(0, inert.y, 0),
+            float3(0, 0, inert.z)
+        );
+        float3x3 tmp = mat * diag_inert * transpose(mat);
+
+        vec10 ci;
+        ci.Ixx = tmp[0][0] + mass[i] * (dif.y * dif.y + dif.z * dif.z);
+        ci.Iyy = tmp[1][1] + mass[i] * (dif.x * dif.x + dif.z * dif.z);
+        ci.Izz = tmp[2][2] + mass[i] * (dif.x * dif.x + dif.y * dif.y);
+        ci.Ixy = tmp[0][1] - mass[i] * dif.x * dif.y;
+        ci.Ixz = tmp[0][2] - mass[i] * dif.x * dif.z;
+        ci.Iyz = tmp[1][2] - mass[i] * dif.y * dif.z;
+        ci.mx = mass[i] * dif.x;
+        ci.my = mass[i] * dif.y;
+        ci.mz = mass[i] * dif.z;
+        ci.m = mass[i];
+        cinert[i] = ci;
+    }
+
+    // Spatial Motion DOFs (cdof) in subtree CoM frame
+    spatial_vec cdof[20];
+    cdof[0] = spatial_vec(float3(0), float3(1, 0, 0));
+    cdof[1] = spatial_vec(float3(0), float3(0, 1, 0));
+    cdof[2] = spatial_vec(float3(0), float3(0, 0, 1));
+
+    float3 offset_root = subtree_com - xanchor[0];
+    cdof[3] = spatial_vec(xmat[2][0], cross(xmat[2][0], offset_root));
+    cdof[4] = spatial_vec(xmat[2][1], cross(xmat[2][1], offset_root));
+    cdof[5] = spatial_vec(xmat[2][2], cross(xmat[2][2], offset_root));
+
+    for (int d = 6; d < 20; ++d) {
+        float3 offset = subtree_com - xanchor[d];
+        float3 ax = xaxis[d];
+        cdof[d] = spatial_vec(ax, cross(ax, offset));
+    }
+
+    // CRBA: Composite Rigid Body Inertias
+    vec10 crb[17];
+    for (int b = 2; b < 17; ++b) {
+        crb[b] = cinert[b];
+    }
+    for (int b = 16; b >= 3; --b) {
+        int pid = bodies[b].parent_id;
+        crb[pid] = crb_add(crb[pid], crb[b]);
+    }
+
+    // Form M(q) including configured armature
+    for (int i = 0; i < 400; ++i) {
+        M_out[i] = 0.0f;
+    }
+
+    for (int i = 0; i < 20; ++i) {
+        int bid = dofs[i].dof_bodyid;
+        spatial_vec buf = inert_vec(crb[bid], cdof[i]);
+        M_out[i * 20 + i] = armature[i] + spatial_dot(cdof[i], buf);
+
+        int j = dofs[i].dof_parentid;
+        while (j >= 0) {
+            float val = spatial_dot(cdof[j], buf);
+            M_out[i * 20 + j] = val;
+            M_out[j * 20 + i] = val;
+            j = dofs[j].dof_parentid;
+        }
+    }
+
+    // RNE: Coriolis, centrifugal, gravity bias forces
+    spatial_vec cvel[17];
+    cvel[0] = spatial_vec(float3(0), float3(0));
+    cvel[1] = spatial_vec(float3(0), float3(0));
+    cvel[2] = spatial_vec(float3(0), float3(0));
+    for (int k = 0; k < 6; ++k) {
+        cvel[2] = cvel[2] + cdof[k] * qvel[k];
+    }
+    for (int b = 3; b < 17; ++b) {
+        int pid = bodies[b].parent_id;
+        int dof = bodies[b].dof_adr;
+        cvel[b] = cvel[pid] + cdof[dof] * qvel[dof];
+    }
+
+    spatial_vec cdof_dot[20];
+    cdof_dot[0] = spatial_vec(float3(0), float3(0));
+    cdof_dot[1] = spatial_vec(float3(0), float3(0));
+    cdof_dot[2] = spatial_vec(float3(0), float3(0));
+    for (int k = 3; k < 6; ++k) {
+        cdof_dot[k] = motion_cross(cvel[2], cdof[k]);
+    }
+    for (int d = 6; d < 20; ++d) {
+        int b = dofs[d].dof_bodyid;
+        cdof_dot[d] = motion_cross(cvel[b], cdof[d]);
+    }
+
+    spatial_vec cacc[17];
+    cacc[0] = spatial_vec(float3(0), float3(0, 0, 9.81f)); // -gravity
+    cacc[1] = cacc[0];
+    cacc[2] = cacc[0];
+    for (int k = 0; k < 6; ++k) {
+        cacc[2] = cacc[2] + cdof_dot[k] * qvel[k];
+    }
+    for (int b = 3; b < 17; ++b) {
+        int pid = bodies[b].parent_id;
+        int dof = bodies[b].dof_adr;
+        cacc[b] = cacc[pid] + cdof_dot[dof] * qvel[dof];
+    }
+
+    spatial_vec cfrc[17];
+    cfrc[0] = spatial_vec(float3(0), float3(0));
+    cfrc[1] = spatial_vec(float3(0), float3(0));
+    for (int b = 2; b < 17; ++b) {
+        spatial_vec iv_acc = inert_vec(cinert[b], cacc[b]);
+        spatial_vec iv_vel = inert_vec(cinert[b], cvel[b]);
+        cfrc[b] = iv_acc + motion_cross_force(cvel[b], iv_vel);
+    }
+
+    for (int b = 16; b >= 3; --b) {
+        int pid = bodies[b].parent_id;
+        cfrc[pid] = cfrc[pid] + cfrc[b];
+    }
+
+    for (int d = 0; d < 20; ++d) {
+        int b = dofs[d].dof_bodyid;
+        bias_out[d] = spatial_dot(cdof[d], cfrc[b]);
+    }
+
+    // Write auxiliary kinematics outputs to device buffers
+    device float* b_xpos = xpos_out + b_idx * 17 * 3;
+    device float* b_xmat = xmat_out + b_idx * 17 * 9;
+    device float* b_xipos = xipos_out + b_idx * 17 * 3;
+    device float* b_ximat = ximat_out + b_idx * 17 * 9;
+    device float* b_com = subtree_com_out + b_idx * 3;
+
+    b_com[0] = subtree_com.x;
+    b_com[1] = subtree_com.y;
+    b_com[2] = subtree_com.z;
+
+    for (int i = 0; i < 17; ++i) {
+        b_xpos[i * 3 + 0] = xpos[i].x;
+        b_xpos[i * 3 + 1] = xpos[i].y;
+        b_xpos[i * 3 + 2] = xpos[i].z;
+
+        b_xipos[i * 3 + 0] = xipos[i].x;
+        b_xipos[i * 3 + 1] = xipos[i].y;
+        b_xipos[i * 3 + 2] = xipos[i].z;
+
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 3; ++c) {
+                b_xmat[i * 9 + r * 3 + c] = xmat[i][c][r]; // row-major
+                b_ximat[i * 9 + r * 3 + c] = ximat[i][c][r]; // row-major
             }
         }
     }
@@ -518,5 +866,87 @@ kernel void kernel_constrained_solve(
             sum += M_inv[i * 20 + j] * qfrc_c[j];
         }
         qacc[i] = sum;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// 4. Native Cholesky Factorization and Multi-RHS Linear Solve Kernel
+// -----------------------------------------------------------------------------
+
+kernel void kernel_cholesky_solve(
+    device const float* M_batch [[buffer(0)]],      // (B, 20, 20)
+    device const float* B_batch [[buffer(1)]],      // (B, 20, K)
+    constant int& K [[buffer(2)]],                  // number of RHS columns
+    device float* L_out [[buffer(3)]],              // (B, 20, 20)
+    device float* X_out [[buffer(4)]],              // (B, 20, K)
+    device int* status_out [[buffer(5)]],           // (B,) 0: success, -1: pivot/NaN failure
+    uint tid [[thread_position_in_grid]]
+) {
+    uint b_idx = tid;
+    device const float* M = M_batch + b_idx * 400;
+    device const float* B = B_batch + b_idx * 20 * K;
+    device float* L = L_out + b_idx * 400;
+    device float* X = X_out + b_idx * 20 * K;
+
+    float L_loc[20][20];
+    for (int i = 0; i < 20; ++i) {
+        for (int j = 0; j < 20; ++j) {
+            L_loc[i][j] = 0.0f;
+        }
+    }
+
+    status_out[b_idx] = 0;
+
+    // Cholesky factorization: M = L * L^T
+    for (int j = 0; j < 20; ++j) {
+        float sum_sq = 0.0f;
+        for (int k = 0; k < j; ++k) {
+            sum_sq += L_loc[j][k] * L_loc[j][k];
+        }
+        float s = M[j * 20 + j] - sum_sq;
+        if (s <= 0.0f || isnan(s)) {
+            status_out[b_idx] = -1; // non-positive pivot or NaN detected
+            return;
+        }
+        float diag = sqrt(s);
+        L_loc[j][j] = diag;
+        float inv_diag = 1.0f / diag;
+
+        for (int i = j + 1; i < 20; ++i) {
+            float sum_prod = 0.0f;
+            for (int k = 0; k < j; ++k) {
+                sum_prod += L_loc[i][k] * L_loc[j][k];
+            }
+            L_loc[i][j] = (M[i * 20 + j] - sum_prod) * inv_diag;
+        }
+    }
+
+    // Write factor L to device output
+    for (int i = 0; i < 20; ++i) {
+        for (int j = 0; j < 20; ++j) {
+            L[i * 20 + j] = L_loc[i][j];
+        }
+    }
+
+    // Solve M X = B for each column c in [0, K-1]
+    float Y_loc[20];
+    for (int c = 0; c < K; ++c) {
+        // Forward solve: L Y = B
+        for (int i = 0; i < 20; ++i) {
+            float s = B[i * K + c];
+            for (int k = 0; k < i; ++k) {
+                s -= L_loc[i][k] * Y_loc[k];
+            }
+            Y_loc[i] = s / L_loc[i][i];
+        }
+
+        // Back solve: L^T X = Y
+        for (int i = 19; i >= 0; --i) {
+            float s = Y_loc[i];
+            for (int k = i + 1; k < 20; ++k) {
+                s -= L_loc[k][i] * X[k * K + c];
+            }
+            X[i * K + c] = s / L_loc[i][i];
+        }
     }
 }

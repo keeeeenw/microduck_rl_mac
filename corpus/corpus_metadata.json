@@ -1,0 +1,18 @@
+{
+  "num_scenarios": 10,
+  "scenarios": [
+    "standing_zero_vel",
+    "standing_moving_vel",
+    "single_support_zero_vel",
+    "single_support_moving_vel",
+    "tilted_landing",
+    "airborne",
+    "nonzero_base_angvel",
+    "near_contact_separation",
+    "contact_onset",
+    "randomized_model_standing"
+  ],
+  "nv": 20,
+  "nq": 21,
+  "nbody": 17
+}
