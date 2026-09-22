@@ -899,3 +899,185 @@ def test_mixed_world_reset_recovery():
     assert res2.integration_status[1].item() == 0
     assert torch.all(torch.isfinite(res2.qpos[1]))
     assert torch.all(torch.isfinite(res2.qvel[1]))
+
+
+# ==============================================================================
+# 6. Trajectory Qualification Harness Regression Tests (CPU-Only)
+# ==============================================================================
+
+import types
+from scripts.eval_trajectory_qualification import (
+    PHYSICAL_GATES,
+    compute_separated_metrics,
+    compute_so3_distance,
+    evaluate_actuator_control_interval,
+    evaluate_free_running_trajectories,
+    validate_metrics,
+    validate_raw_state,
+    validate_statuses,
+)
+from src.representative_physics_slice import AutonomousStepOutputs
+
+
+def test_harness_passing_metrics():
+    """Verifies that within-gate metrics and valid statuses produce zero violations."""
+    clean_metrics = {
+        "pos_err": 1e-6,
+        "so3_err": 1e-6,
+        "linvel_err": 1e-4,
+        "angvel_err": 1e-4,
+        "jnt_pos_err": 1e-6,
+        "jnt_vel_err": 1e-4,
+    }
+    assert len(validate_metrics(clean_metrics, "test_clean")) == 0
+    assert len(validate_raw_state(np.zeros(21), np.zeros(20), "test_clean")) == 0
+    assert len(validate_statuses(0, 0, "test_clean")) == 0
+
+
+@pytest.mark.parametrize("metric_key,limit", list(PHYSICAL_GATES.items()))
+def test_harness_finite_overlimit_in_each_metric(metric_key, limit):
+    """Verifies that any metric exceeding its gate generates an explicit violation."""
+    metrics = {k: 0.0 for k in PHYSICAL_GATES}
+    metrics[metric_key] = limit * 1.5
+    violations = validate_metrics(metrics, "test_overlimit")
+    assert len(violations) == 1
+    assert metric_key in violations[0]
+    assert "limit" in violations[0]
+
+
+def test_harness_intermediate_spike_with_passing_endpoint():
+    """Verifies that an intermediate trajectory spike is caught by full-trace maxima even if the endpoint passes."""
+    step_metrics_history = [
+        {"pos_err": 1e-6, "so3_err": 0.0, "linvel_err": 1e-6, "angvel_err": 0.0, "jnt_pos_err": 0.0, "jnt_vel_err": 0.0},
+        {"pos_err": 0.05, "so3_err": 0.0, "linvel_err": 1e-6, "angvel_err": 0.0, "jnt_pos_err": 0.0, "jnt_vel_err": 0.0},  # Spike at step 2
+        {"pos_err": 1e-6, "so3_err": 0.0, "linvel_err": 1e-6, "angvel_err": 0.0, "jnt_pos_err": 0.0, "jnt_vel_err": 0.0},
+        {"pos_err": 1e-6, "so3_err": 0.0, "linvel_err": 1e-6, "angvel_err": 0.0, "jnt_pos_err": 0.0, "jnt_vel_err": 0.0},  # Endpoint passes at step 4
+    ]
+    max_metrics = {}
+    for k in PHYSICAL_GATES:
+        max_metrics[k] = float(max(step_metrics_history[t - 1][k] for t in range(1, 5)))
+
+    violations = validate_metrics(max_metrics, "horizon_4_trace_max")
+    assert len(violations) == 1
+    assert "pos_err" in violations[0]
+    assert "limit 1.00e-03" in violations[0]
+
+
+def test_harness_nonfinite_raw_state_and_safe_computation():
+    """Verifies non-finite raw state detection and graceful NaN propagation without crash."""
+    nan_qp = np.zeros(21)
+    nan_qp[0] = float("nan")
+    clean_qv = np.zeros(20)
+
+    # validate_raw_state must catch NaN before normalization
+    raw_v = validate_raw_state(nan_qp, clean_qv, "test_nan")
+    assert len(raw_v) == 1
+    assert "non-finite raw qpos" in raw_v[0]
+
+    # compute_so3_distance must safely return NaN rather than crash
+    dist = compute_so3_distance(nan_qp[3:7], np.array([1.0, 0.0, 0.0, 0.0]))
+    assert math.isnan(dist)
+
+    # compute_separated_metrics must return all NaN metrics
+    sep = compute_separated_metrics(nan_qp, clean_qv, np.zeros(21), clean_qv)
+    for k in PHYSICAL_GATES:
+        assert math.isnan(sep[k])
+
+    # validate_metrics must reject NaN metrics as non-finite
+    m_viol = validate_metrics(sep, "test_nan_metrics")
+    assert len(m_viol) == len(PHYSICAL_GATES)
+    assert all("non-finite" in v for v in m_viol)
+
+
+def test_harness_intermediate_failure_status():
+    """Verifies that negative solver status and nonzero integration status trigger violations, while status 1 is preserved."""
+    # Negative solver status -> violation
+    v_solver = validate_statuses(-1, 0, "test_solver_fail")
+    assert len(v_solver) == 1
+    assert "solver failure" in v_solver[0]
+
+    # Nonzero integration status -> violation
+    v_int = validate_statuses(0, -2, "test_int_fail")
+    assert len(v_int) == 1
+    assert "integration failure" in v_int[0]
+
+    # Solver status 1 (exhausted iterations) is diagnostic -> no failure violation
+    v_diag = validate_statuses(1, 0, "test_diag_exhausted")
+    assert len(v_diag) == 0
+
+
+def test_harness_deliberate_meter_offset_reproduction():
+    """Exercises the reviewer's CPU stub reproduction: shifts root x by 1m and verifies violations are caught."""
+    class CpuTensorStub:
+        def __init__(self):
+            self.device = torch.device("cpu")
+
+        def rollout_trajectory(self, qpos_init, qvel_init, num_steps, dt):
+            B = qpos_init.shape[0]
+            qpos = qpos_init.repeat(num_steps + 1, 1, 1).clone()
+            qpos[:, :, 0] += 1.0  # 1 metre deliberate offset
+            qvel = qvel_init.repeat(num_steps + 1, 1, 1).clone()
+            return {
+                "qpos": qpos,
+                "qvel": qvel,
+                "nefc": torch.zeros((num_steps, B), dtype=torch.int32),
+                "solver_status": torch.zeros((num_steps, B), dtype=torch.int32),
+                "integration_status": torch.zeros((num_steps, B), dtype=torch.int32),
+            }
+
+        def step_autonomous(self, qpos, qvel, **kwargs):
+            qp = qpos.clone()
+            qp[:, 0] += 1.0  # 1 metre deliberate offset
+            qv = qvel.clone()
+            B = qpos.shape[0]
+            phys = types.SimpleNamespace(
+                solver_status=torch.zeros((B,), dtype=torch.int32),
+                nefc=torch.zeros((B,), dtype=torch.int32),
+            )
+            return AutonomousStepOutputs(
+                qpos=qp,
+                qvel=qv,
+                integration_status=torch.zeros((B,), dtype=torch.int32),
+                physics_outputs=phys,
+            )
+
+        def step_control_interval(self, qpos, qvel, ctrl, num_substeps=4, dt=0.005):
+            substeps = []
+            cur_p = qpos.clone()
+            cur_v = qvel.clone()
+            for _ in range(num_substeps):
+                step_out = self.step_autonomous(cur_p, cur_v, ctrl=ctrl, dt=dt)
+                substeps.append(step_out)
+                cur_p = step_out.qpos
+                cur_v = step_out.qvel
+            return cur_p, cur_v, substeps
+
+    canonical = load_canonical_model()
+    stub = CpuTensorStub()
+
+    # Free-running trajectory evaluator MUST return gate violations
+    _, traj_violations = evaluate_free_running_trajectories(stub, canonical)
+    assert len(traj_violations) > 0
+    assert any("pos_err" in v and "limit 1.00e-03" in v for v in traj_violations)
+
+    # Actuator evaluator MUST return gate violations
+    _, act_violations = evaluate_actuator_control_interval(stub, canonical)
+    assert len(act_violations) > 0
+    assert any("pos_err" in v and "limit 1.00e-03" in v for v in act_violations)
+
+
+def test_harness_report_command_exits_nonzero_on_failure(monkeypatch):
+    """Verifies that any evaluator violation causes the evaluation script main() to exit with code 1."""
+    import scripts.eval_trajectory_qualification as etq
+
+    # Monkeypatch evaluate_free_running_trajectories to return an artificial violation
+    monkeypatch.setattr(
+        etq,
+        "evaluate_free_running_trajectories",
+        lambda ps, canonical: ({}, ["artificial_failure: pos_err=2.00e-03 > limit 1.00e-03"]),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        etq.main()
+    assert exc_info.value.code == 1
+

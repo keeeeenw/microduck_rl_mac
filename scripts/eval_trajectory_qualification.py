@@ -32,20 +32,44 @@ from src.canonical_model_loader import (
 from src.representative_physics_slice import RepresentativePhysicsSlice
 
 # Canonical Milestone 4 Physical Qualification Gates
-GATE_POS_MAX = 1e-3       # 1.0 mm
-GATE_SO3_MAX = 1e-3       # 1.0 mrad
-GATE_LINVEL_MAX = 0.05    # 0.05 m/s
-GATE_ANGVEL_MAX = 0.05    # 0.05 rad/s
-GATE_JNTPOS_MAX = 1e-3    # 1.0 mrad
-GATE_JNTVEL_MAX = 0.05    # 0.05 rad/s
+PHYSICAL_GATES: Dict[str, float] = {
+    "pos_err": 1e-3,       # 1.0 mm
+    "so3_err": 1e-3,       # 1.0 mrad
+    "linvel_err": 0.05,    # 0.05 m/s
+    "angvel_err": 0.05,    # 0.05 rad/s
+    "jnt_pos_err": 1e-3,   # 1.0 mrad
+    "jnt_vel_err": 0.05,   # 0.05 rad/s
+}
+
+GATE_POS_MAX = PHYSICAL_GATES["pos_err"]
+GATE_SO3_MAX = PHYSICAL_GATES["so3_err"]
+GATE_LINVEL_MAX = PHYSICAL_GATES["linvel_err"]
+GATE_ANGVEL_MAX = PHYSICAL_GATES["angvel_err"]
+GATE_JNTPOS_MAX = PHYSICAL_GATES["jnt_pos_err"]
+GATE_JNTVEL_MAX = PHYSICAL_GATES["jnt_vel_err"]
+
+
+def safe_mps_sync():
+    """Synchronizes MPS device if available; no-op on CPU."""
+    if torch.backends.mps.is_available():
+        try:
+            torch.mps.synchronize()
+        except Exception:
+            pass
 
 
 def compute_so3_distance(q1: np.ndarray, q2: np.ndarray) -> float:
     """Computes geodesic angular distance on SO(3) invariant to q ~ -q."""
+    if not (np.all(np.isfinite(q1)) and np.all(np.isfinite(q2))):
+        return float("nan")
     q1_64 = q1.astype(np.float64)
     q2_64 = q2.astype(np.float64)
-    q1_norm = q1_64 / max(1e-14, float(np.linalg.norm(q1_64)))
-    q2_norm = q2_64 / max(1e-14, float(np.linalg.norm(q2_64)))
+    norm1 = float(np.linalg.norm(q1_64))
+    norm2 = float(np.linalg.norm(q2_64))
+    if norm1 < 1e-8 or norm2 < 1e-8:
+        return float("nan")
+    q1_norm = q1_64 / norm1
+    q2_norm = q2_64 / norm2
     dot = float(np.abs(np.dot(q1_norm, q2_norm)))
     dot_clamped = min(1.0, max(0.0, dot))
     return float(2.0 * np.arccos(dot_clamped))
@@ -53,6 +77,8 @@ def compute_so3_distance(q1: np.ndarray, q2: np.ndarray) -> float:
 
 def compute_separated_metrics(qp_gpu: np.ndarray, qv_gpu: np.ndarray, qp_cpu: np.ndarray, qv_cpu: np.ndarray) -> Dict[str, float]:
     """Computes separated metrics without pooling quantities of different units."""
+    if not (np.all(np.isfinite(qp_gpu)) and np.all(np.isfinite(qv_gpu)) and np.all(np.isfinite(qp_cpu)) and np.all(np.isfinite(qv_cpu))):
+        return {k: float("nan") for k in PHYSICAL_GATES}
     pos_err = float(np.max(np.abs(qp_gpu[0:3] - qp_cpu[0:3])))
     so3_err = compute_so3_distance(qp_gpu[3:7], qp_cpu[3:7])
     linvel_err = float(np.max(np.abs(qv_gpu[0:3] - qv_cpu[0:3])))
@@ -67,6 +93,45 @@ def compute_separated_metrics(qp_gpu: np.ndarray, qv_gpu: np.ndarray, qp_cpu: np
         "jnt_pos_err": jnt_pos_err,
         "jnt_vel_err": jnt_vel_err,
     }
+
+
+def validate_raw_state(qpos: np.ndarray, qvel: np.ndarray, context: str) -> List[str]:
+    """Validates raw candidate state arrays for finiteness before normalization or metric reduction."""
+    violations = []
+    if not np.all(np.isfinite(qpos)):
+        violations.append(f"{context}: non-finite raw qpos")
+    if not np.all(np.isfinite(qvel)):
+        violations.append(f"{context}: non-finite raw qvel")
+    return violations
+
+
+def validate_statuses(solver_stat: int, int_stat: int, context: str) -> List[str]:
+    """Validates solver and integration statuses.
+    
+    Negative solver_status indicates an unhandled solver failure.
+    Solver status 1 (exhausted iterations) is allowed as diagnostic reporting.
+    Nonzero integration_status indicates an integration failure.
+    """
+    violations = []
+    if solver_stat < 0:
+        violations.append(f"{context}: solver failure (status={solver_stat})")
+    if int_stat != 0:
+        violations.append(f"{context}: integration failure (status={int_stat})")
+    return violations
+
+
+def validate_metrics(metrics: Dict[str, float], context: str) -> List[str]:
+    """Validates metric differences against canonical physical gates independently."""
+    violations = []
+    for key, limit in PHYSICAL_GATES.items():
+        if key not in metrics:
+            continue
+        val = metrics[key]
+        if not math.isfinite(val):
+            violations.append(f"{context}: {key} non-finite ({val})")
+        elif val > limit:
+            violations.append(f"{context}: {key}={val:.2e} > limit {limit:.2e}")
+    return violations
 
 
 def compute_kkt(out, nefc: int, max_iters: int) -> Dict:
@@ -177,35 +242,25 @@ def evaluate_common_state_one_step(
             per_world_mass=pwm, per_world_ipos=pwi, per_world_armature=pwa,
             max_iters=200, tol=1e-5, dt=0.005
         )
-        torch.mps.synchronize()
+        safe_mps_sync()
 
         qp_gpu = step_res.qpos[0].cpu().numpy()
         qv_gpu = step_res.qvel[0].cpu().numpy()
         int_stat = int(step_res.integration_status[0].cpu().item())
-
-        metrics = compute_separated_metrics(qp_gpu, qv_gpu, d_matched.qpos, d_matched.qvel)
+        s_stat = int(step_res.physics_outputs.solver_status[0].cpu().item())
         nefc = int(step_res.physics_outputs.nefc[0].cpu().item())
         kkt = compute_kkt(step_res.physics_outputs, nefc, 200)
 
         # Gate enforcement
         violations = []
-        if int_stat != 0:
-            violations.append(f"integration_status={int_stat}")
-        for m_key, val, limit in [
-            ("pos_err", metrics["pos_err"], GATE_POS_MAX),
-            ("so3_err", metrics["so3_err"], GATE_SO3_MAX),
-            ("linvel_err", metrics["linvel_err"], GATE_LINVEL_MAX),
-            ("angvel_err", metrics["angvel_err"], GATE_ANGVEL_MAX),
-            ("jnt_pos_err", metrics["jnt_pos_err"], GATE_JNTPOS_MAX),
-            ("jnt_vel_err", metrics["jnt_vel_err"], GATE_JNTVEL_MAX),
-        ]:
-            if not math.isfinite(val):
-                violations.append(f"{m_key} non-finite ({val})")
-            elif val > limit:
-                violations.append(f"{m_key}={val:.2e} > {limit:.2e}")
+        violations.extend(validate_raw_state(qp_gpu, qv_gpu, sc_name))
+        violations.extend(validate_statuses(s_stat, int_stat, sc_name))
+
+        metrics = compute_separated_metrics(qp_gpu, qv_gpu, d_matched.qpos, d_matched.qvel)
+        violations.extend(validate_metrics(metrics, sc_name))
 
         if violations:
-            gate_violations.append(f"{sc_name}: {'; '.join(violations)}")
+            gate_violations.extend(violations)
 
         results.append({
             "scenario": sc_name,
@@ -272,7 +327,7 @@ def evaluate_free_running_trajectories(
         qp_t = torch.from_numpy(qpos_init.astype(np.float32)).unsqueeze(0).to(ps.device)
         qv_t = torch.from_numpy(qvel_init.astype(np.float32)).unsqueeze(0).to(ps.device)
         rollout = ps.rollout_trajectory(qp_t, qv_t, num_steps=max_step, dt=0.005)
-        torch.mps.synchronize()
+        safe_mps_sync()
 
         gpu_qpos = rollout["qpos"][:, 0, :].cpu().numpy()
         gpu_qvel = rollout["qvel"][:, 0, :].cpu().numpy()
@@ -292,18 +347,51 @@ def evaluate_free_running_trajectories(
             cpu_qvel.append(d_matched.qvel.copy())
             cpu_ncon.append(d_matched.ncon)
 
-        # Compute point metrics and trace maxima up to each checkpoint
+        # Validate every step t in [1, max_step]
+        step_metrics_history = []
+        for t in range(1, max_step + 1):
+            ctx_t = f"{regime_name} step {t}"
+            # 1. Raw state finiteness
+            raw_v = validate_raw_state(gpu_qpos[t], gpu_qvel[t], ctx_t)
+            gate_violations.extend(raw_v)
+
+            # 2. Statuses
+            s_stat = int(gpu_stat[t - 1])
+            i_stat = int(gpu_int_stat[t - 1])
+            stat_v = validate_statuses(s_stat, i_stat, ctx_t)
+            gate_violations.extend(stat_v)
+
+            # 3. Compute step metrics
+            if raw_v:
+                m_t = {k: float("nan") for k in PHYSICAL_GATES}
+            else:
+                m_t = compute_separated_metrics(gpu_qpos[t], gpu_qvel[t], cpu_qpos[t], cpu_qvel[t])
+            step_metrics_history.append(m_t)
+
+        # Compute point metrics and trace maxima up to each reported checkpoint
         regime_eval = {}
         for s in config["steps"]:
-            m_sep = compute_separated_metrics(gpu_qpos[s], gpu_qvel[s], cpu_qpos[s], cpu_qvel[s])
+            m_sep = step_metrics_history[s - 1]
 
             # Full-trace maxima over steps 1..s
-            max_pos = max(float(np.max(np.abs(gpu_qpos[t, 0:3] - cpu_qpos[t][0:3]))) for t in range(1, s + 1))
-            max_so3 = max(compute_so3_distance(gpu_qpos[t, 3:7], cpu_qpos[t][3:7]) for t in range(1, s + 1))
-            max_linvel = max(float(np.max(np.abs(gpu_qvel[t, 0:3] - cpu_qvel[t][0:3]))) for t in range(1, s + 1))
-            max_angvel = max(float(np.max(np.abs(gpu_qvel[t, 3:6] - cpu_qvel[t][3:6]))) for t in range(1, s + 1))
-            max_jnt_pos = max(float(np.max(np.abs(gpu_qpos[t, 7:21] - cpu_qpos[t][7:21]))) for t in range(1, s + 1))
-            max_jnt_vel = max(float(np.max(np.abs(gpu_qvel[t, 6:20] - cpu_qvel[t][6:20]))) for t in range(1, s + 1))
+            max_metrics = {}
+            for k in PHYSICAL_GATES:
+                vals = [step_metrics_history[t - 1][k] for t in range(1, s + 1)]
+                if any(not math.isfinite(v) for v in vals):
+                    max_metrics[k] = float("nan")
+                else:
+                    max_metrics[k] = float(max(vals))
+
+            # Validate full-trace maxima against physical gates!
+            trace_v = validate_metrics(max_metrics, f"{regime_name} horizon {s} steps ({s*5}ms) trace max")
+            gate_violations.extend(trace_v)
+
+            passed_checkpoint = (
+                len(trace_v) == 0
+                and int(gpu_int_stat[s - 1]) == 0
+                and int(gpu_stat[s - 1]) >= 0
+                and all(int(gpu_int_stat[t - 1]) == 0 and int(gpu_stat[t - 1]) >= 0 for t in range(1, s + 1))
+            )
 
             regime_eval[s] = {
                 "t_ms": s * 5,
@@ -313,21 +401,18 @@ def evaluate_free_running_trajectories(
                 "angvel_err": m_sep["angvel_err"],
                 "jnt_pos_err": m_sep["jnt_pos_err"],
                 "jnt_vel_err": m_sep["jnt_vel_err"],
-                "max_pos_err": max_pos,
-                "max_so3_err": max_so3,
-                "max_linvel_err": max_linvel,
-                "max_angvel_err": max_angvel,
-                "max_jnt_pos_err": max_jnt_pos,
-                "max_jnt_vel_err": max_jnt_vel,
+                "max_pos_err": max_metrics["pos_err"],
+                "max_so3_err": max_metrics["so3_err"],
+                "max_linvel_err": max_metrics["linvel_err"],
+                "max_angvel_err": max_metrics["angvel_err"],
+                "max_jnt_pos_err": max_metrics["jnt_pos_err"],
+                "max_jnt_vel_err": max_metrics["jnt_vel_err"],
                 "nefc_gpu": int(gpu_nefc[s - 1]),
                 "ncon_cpu": int(cpu_ncon[s]),
                 "stat_gpu": int(gpu_stat[s - 1]),
                 "int_stat_gpu": int(gpu_int_stat[s - 1]),
+                "passed": passed_checkpoint,
             }
-
-            # Check integration status
-            if int(gpu_int_stat[s - 1]) != 0:
-                gate_violations.append(f"{regime_name} step {s}: integration_status={int(gpu_int_stat[s - 1])}")
 
         trajectory_results[regime_name] = regime_eval
 
@@ -347,7 +432,9 @@ def evaluate_actuator_control_interval(
     qvel = data["qvel"].copy()
     ctrl = np.linspace(-0.6, 0.6, 14, dtype=np.float64)
 
-    # 1 Step (5 ms)
+    violations = []
+
+    # Experiment 1: 1 Step (5 ms) with fresh state
     d.qpos[:] = qpos
     d.qvel[:] = qvel
     d.ctrl[:] = ctrl
@@ -358,31 +445,62 @@ def evaluate_actuator_control_interval(
     ctrl_t = torch.from_numpy(ctrl.astype(np.float32)).unsqueeze(0).to(ps.device)
 
     step_res = ps.step_autonomous(qp_t, qv_t, ctrl=ctrl_t, dt=0.005)
-    torch.mps.synchronize()
+    safe_mps_sync()
 
-    m_1step = compute_separated_metrics(step_res.qpos[0].cpu().numpy(), step_res.qvel[0].cpu().numpy(), d.qpos, d.qvel)
+    qp_1s = step_res.qpos[0].cpu().numpy()
+    qv_1s = step_res.qvel[0].cpu().numpy()
+    stat_1s = int(step_res.physics_outputs.solver_status[0].cpu().item())
+    int_stat_1s = int(step_res.integration_status[0].cpu().item())
 
-    # 4 Substeps (20 ms control interval)
+    ctx_1s = "actuator_1step_5ms"
+    violations.extend(validate_raw_state(qp_1s, qv_1s, ctx_1s))
+    violations.extend(validate_statuses(stat_1s, int_stat_1s, ctx_1s))
+    m_1step = compute_separated_metrics(qp_1s, qv_1s, d.qpos, d.qvel)
+    violations.extend(validate_metrics(m_1step, ctx_1s))
+
+    # Experiment 2: 4 Substeps (20 ms control interval) with fresh state
     d.qpos[:] = qpos
     d.qvel[:] = qvel
     d.ctrl[:] = ctrl
-    for _ in range(4):
+
+    qp_next, qv_next, substep_outputs = ps.step_control_interval(qp_t, qv_t, ctrl_t, num_substeps=4, dt=0.005)
+    safe_mps_sync()
+
+    substep_metrics = []
+    for k in range(4):
         mujoco.mj_step(m_matched, d)
+        sub_res = substep_outputs[k]
+        sub_qp = sub_res.qpos[0].cpu().numpy()
+        sub_qv = sub_res.qvel[0].cpu().numpy()
+        sub_sstat = int(sub_res.physics_outputs.solver_status[0].cpu().item())
+        sub_istat = int(sub_res.integration_status[0].cpu().item())
 
-    qp_next, qv_next, _ = ps.step_control_interval(qp_t, qv_t, ctrl_t, num_substeps=4, dt=0.005)
-    torch.mps.synchronize()
+        ctx_sub = f"actuator_substep_{k+1}_of_4"
+        violations.extend(validate_raw_state(sub_qp, sub_qv, ctx_sub))
+        violations.extend(validate_statuses(sub_sstat, sub_istat, ctx_sub))
+        m_sub = compute_separated_metrics(sub_qp, sub_qv, d.qpos, d.qvel)
+        violations.extend(validate_metrics(m_sub, ctx_sub))
+        substep_metrics.append(m_sub)
 
+    # Full-trace max across the 4 substeps
+    max_sub_metrics = {}
+    for key in PHYSICAL_GATES:
+        vals = [m[key] for m in substep_metrics]
+        if any(not math.isfinite(v) for v in vals):
+            max_sub_metrics[key] = float("nan")
+        else:
+            max_sub_metrics[key] = float(max(vals))
+
+    violations.extend(validate_metrics(max_sub_metrics, "actuator_4substeps_trace_max"))
+
+    # Final endpoint metric
     m_ctrl_int = compute_separated_metrics(qp_next[0].cpu().numpy(), qv_next[0].cpu().numpy(), d.qpos, d.qvel)
-
-    violations = []
-    for label, m_dict in [("1step_5ms", m_1step), ("ctrl_int_20ms", m_ctrl_int)]:
-        for k, v in m_dict.items():
-            if not math.isfinite(v):
-                violations.append(f"{label} {k} non-finite ({v})")
 
     return {
         "1step_5ms": m_1step,
         "ctrl_int_20ms": m_ctrl_int,
+        "substeps": substep_metrics,
+        "max_substep_metrics": max_sub_metrics,
     }, violations
 
 
@@ -405,38 +523,50 @@ def main():
         )
 
     print("\n## 2. Free-Running Trajectory Qualification (Endpoints and Full-Trace Maxima)")
-    print("| Regime | Step | Time (ms) | Checkpoint Pos (m) | Trace Max Pos (m) | Checkpoint SO(3) | Trace Max SO(3) | Checkpoint LinVel | Trace Max LinVel | GPU nefc | CPU ncon | Stat | IntStat |")
-    print("|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|")
+    print("| Regime | Step | Time (ms) | Checkpoint Pos (m) | Trace Max Pos (m) | Checkpoint SO(3) | Trace Max SO(3) | Checkpoint LinVel | Trace Max LinVel | GPU nefc | CPU ncon | Stat | IntStat | Status |")
+    print("|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|")
 
     trajectories, traj_violations = evaluate_free_running_trajectories(ps, canonical)
     for regime, steps_data in trajectories.items():
         for s, d in steps_data.items():
+            status_str = "PASS" if d["passed"] else "FAIL"
             print(
                 f"| `{regime}` | {s} | {d['t_ms']} | {d['pos_err']:.2e} | {d['max_pos_err']:.2e} | "
                 f"{d['so3_err']:.2e} | {d['max_so3_err']:.2e} | {d['linvel_err']:.2e} | {d['max_linvel_err']:.2e} | "
-                f"{d['nefc_gpu']} | {d['ncon_cpu']} | {d['stat_gpu']} | {d['int_stat_gpu']} |"
+                f"{d['nefc_gpu']} | {d['ncon_cpu']} | {d['stat_gpu']} | {d['int_stat_gpu']} | **{status_str}** |"
             )
 
     print("\n## 3. Actuator Torque Control & 20 ms Control Interval (4 Substeps)")
-    print("| Interval | Pos Err (m) | SO(3) Err (rad) | LinVel Err (m/s) | AngVel Err (rad/s) | JntPos Err (rad) | JntVel Err (rad/s) |")
-    print("|---|:---:|:---:|:---:|:---:|:---:|:---:|")
+    print("| Interval / Substep | Pos Err (m) | SO(3) Err (rad) | LinVel Err (m/s) | AngVel Err (rad/s) | JntPos Err (rad) | JntVel Err (rad/s) | Status |")
+    print("|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|")
 
     act_results, act_violations = evaluate_actuator_control_interval(ps, canonical)
-    for label, metrics in act_results.items():
+    for label in ["1step_5ms", "ctrl_int_20ms"]:
+        metrics = act_results[label]
+        v_sub = validate_metrics(metrics, label)
+        status_str = "PASS" if len(v_sub) == 0 else "FAIL"
         print(
             f"| `{label}` | {metrics['pos_err']:.2e} | {metrics['so3_err']:.2e} | "
             f"{metrics['linvel_err']:.2e} | {metrics['angvel_err']:.2e} | "
-            f"{metrics['jnt_pos_err']:.2e} | {metrics['jnt_vel_err']:.2e} |"
+            f"{metrics['jnt_pos_err']:.2e} | {metrics['jnt_vel_err']:.2e} | **{status_str}** |"
+        )
+    for k, sub_m in enumerate(act_results["substeps"]):
+        v_sub = validate_metrics(sub_m, f"substep_{k+1}")
+        status_str = "PASS" if len(v_sub) == 0 else "FAIL"
+        print(
+            f"| `substep_{k+1}_of_4` | {sub_m['pos_err']:.2e} | {sub_m['so3_err']:.2e} | "
+            f"{sub_m['linvel_err']:.2e} | {sub_m['angvel_err']:.2e} | "
+            f"{sub_m['jnt_pos_err']:.2e} | {sub_m['jnt_vel_err']:.2e} | **{status_str}** |"
         )
 
     all_violations = one_step_violations + traj_violations + act_violations
     if all_violations:
-        print("\n### ❌ ENFORCED QUALIFICATION GATE FAILURES:")
+        print(f"\n### ❌ ENFORCED QUALIFICATION GATE FAILURES ({len(all_violations)} violations):")
         for v in all_violations:
             print(f"- {v}")
         sys.exit(1)
     else:
-        print("\n### ✅ ALL 25 SCENARIOS & TRAJECTORIES PASSED ENFORCED NUMERICAL GATES.")
+        print("\n### ✅ ALL 25 SCENARIOS, TRAJECTORIES & ACTUATOR SUBSTEPS PASSED ENFORCED NUMERICAL GATES.")
 
 
 if __name__ == "__main__":

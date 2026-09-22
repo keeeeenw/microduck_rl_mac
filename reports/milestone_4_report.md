@@ -63,12 +63,13 @@ The full regression test suite passed cleanly with 336 tests:
 - **Dynamic Test Inventory Breakdown**:
   - `tests/test_cad_contacts_and_assembly.py`: 161 passed
   - `tests/test_metal_constraint_solver.py`: 75 passed
-  - `tests/test_time_integration.py`: 47 passed
+  - `tests/test_time_integration.py`: 59 passed (including 12 CPU-only harness regression tests)
   - `tests/test_native_dynamics_and_solves.py`: 38 passed
-  - `tests/test_representative_physics.py`: 7 passed
-  - `tests/test_shared_buffer.py`: 6 passed
+  - `tests/test_canonical_model.py`: 5 passed
+  - `tests/test_representative_physics.py`: 5 passed
+  - `tests/test_shared_buffer.py`: 3 passed
   - `tests/test_task_inventory.py`: 2 passed
-  - **Total**: 336 passed
+  - **Total**: 348 passed
 
 ---
 
@@ -120,18 +121,18 @@ Evaluated on GPU via `scripts/eval_trajectory_qualification.py` against matched 
 
 Evaluated without CPU state overwriting during rollout. Full-trace maxima are tracked over all steps up to each duration checkpoint:
 
-| Regime | Step | Time (ms) | Checkpoint Pos (m) | Trace Max Pos (m) | Checkpoint SO(3) | Trace Max SO(3) | Checkpoint LinVel | Trace Max LinVel | GPU nefc | CPU ncon | Stat | IntStat |
-|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| `airborne` | 4 | 20 | 6.04e-08 | 3.42e-07 | 0.00e+00 | 0.00e+00 | 3.10e-08 | 3.10e-08 | 0 | 0 | 0 | 0 |
-| `airborne` | 20 | 100 | 1.14e-06 | 1.14e-06 | 0.00e+00 | 0.00e+00 | 2.33e-07 | 3.39e-07 | 0 | 0 | 0 | 0 |
-| `airborne` | 200 | 1000 | 1.62e-06 | 1.67e-06 | 6.02e-07 | 6.02e-07 | 5.00e-06 | 8.25e-06 | 0 | 0 | 0 | 0 |
-| `nominal_standing_realistic` | 4 | 20 | 9.15e-09 | 9.15e-09 | 9.42e-08 | 9.42e-08 | 7.22e-07 | 7.53e-07 | 24 | 6 | 1 | 0 |
-| `nominal_standing_realistic` | 20 | 100 | 3.57e-08 | 4.53e-08 | 1.98e-07 | 2.49e-07 | 4.58e-07 | 1.06e-06 | 24 | 6 | 0 | 0 |
-| `contact_onset_drop` | 4 | 20 | 1.21e-08 | 1.51e-08 | 0.00e+00 | 0.00e+00 | 2.81e-08 | 2.81e-08 | 0 | 0 | 0 | 0 |
-| `contact_onset_drop` | 20 | 100 | 1.31e-09 | 1.57e-08 | 0.00e+00 | 0.00e+00 | 3.64e-07 | 3.64e-07 | 0 | 0 | 0 | 0 |
-| `contact_onset_drop` | 25 | 125 | 1.73e-08 | 1.73e-08 | 2.23e-07 | 2.23e-07 | 1.25e-06 | 1.25e-06 | 16 | 4 | 1 | 0 |
-| `sliding_lateral_velocity` | 4 | 20 | 2.11e-09 | 2.56e-09 | 3.01e-07 | 3.01e-07 | 5.17e-07 | 5.17e-07 | 24 | 6 | 1 | 0 |
-| `sliding_lateral_velocity` | 20 | 100 | 4.56e-09 | 8.87e-09 | 2.56e-06 | 2.56e-06 | 2.45e-07 | 7.22e-07 | 8 | 2 | 0 | 0 |
+| Regime | Step | Time (ms) | Checkpoint Pos (m) | Trace Max Pos (m) | Checkpoint SO(3) | Trace Max SO(3) | Checkpoint LinVel | Trace Max LinVel | GPU nefc | CPU ncon | Stat | IntStat | Status |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| `airborne` | 4 | 20 | 6.04e-08 | 3.42e-07 | 0.00e+00 | 0.00e+00 | 3.10e-08 | 3.10e-08 | 0 | 0 | 0 | 0 | **PASS** |
+| `airborne` | 20 | 100 | 1.14e-06 | 1.14e-06 | 0.00e+00 | 0.00e+00 | 2.33e-07 | 3.39e-07 | 0 | 0 | 0 | 0 | **PASS** |
+| `airborne` | 200 | 1000 | 1.62e-06 | 1.67e-06 | 6.02e-07 | 6.02e-07 | 5.00e-06 | 8.25e-06 | 0 | 0 | 0 | 0 | **PASS** |
+| `nominal_standing_realistic` | 4 | 20 | 9.15e-09 | 9.15e-09 | 9.42e-08 | 9.42e-08 | 7.22e-07 | 7.53e-07 | 24 | 6 | 1 | 0 | **PASS** |
+| `nominal_standing_realistic` | 20 | 100 | 3.57e-08 | 4.53e-08 | 1.98e-07 | 2.49e-07 | 4.58e-07 | 1.06e-06 | 24 | 6 | 0 | 0 | **PASS** |
+| `contact_onset_drop` | 4 | 20 | 1.21e-08 | 1.51e-08 | 0.00e+00 | 0.00e+00 | 2.81e-08 | 2.81e-08 | 0 | 0 | 0 | 0 | **PASS** |
+| `contact_onset_drop` | 20 | 100 | 1.31e-09 | 1.57e-08 | 0.00e+00 | 0.00e+00 | 3.64e-07 | 3.64e-07 | 0 | 0 | 0 | 0 | **PASS** |
+| `contact_onset_drop` | 25 | 125 | 1.73e-08 | 1.73e-08 | 2.23e-07 | 2.23e-07 | 1.25e-06 | 1.25e-06 | 16 | 4 | 1 | 0 | **PASS** |
+| `sliding_lateral_velocity` | 4 | 20 | 2.11e-09 | 2.56e-09 | 3.01e-07 | 3.01e-07 | 5.17e-07 | 5.17e-07 | 24 | 6 | 1 | 0 | **PASS** |
+| `sliding_lateral_velocity` | 20 | 100 | 4.56e-09 | 8.87e-09 | 2.56e-06 | 2.56e-06 | 2.45e-07 | 7.22e-07 | 8 | 2 | 0 | 0 | **PASS** |
 
 ### Key Trajectory Findings
 1. **Pure Airborne Flight (200 Steps / 1.0 s)**:
@@ -152,16 +153,21 @@ Evaluated without CPU state overwriting during rollout. Full-trace maxima are tr
 
 Evaluated with 14 joint torque commands passed through `ctrl`:
 
-| Interval | Pos Err (m) | SO(3) Err (rad) | LinVel Err (m/s) | AngVel Err (rad/s) | JntPos Err (rad) | JntVel Err (rad/s) |
-|---|:---:|:---:|:---:|:---:|:---:|:---:|
-| `1step_5ms` | 1.93e-08 | 0.00e+00 | 1.57e-08 | 1.43e-07 | 2.71e-08 | 4.65e-07 |
-| `ctrl_int_20ms` (4 substeps) | 8.18e-09 | 0.00e+00 | 2.18e-08 | 3.35e-07 | 2.77e-08 | 1.11e-06 |
+| Interval / Substep | Pos Err (m) | SO(3) Err (rad) | LinVel Err (m/s) | AngVel Err (rad/s) | JntPos Err (rad) | JntVel Err (rad/s) | Status |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| `1step_5ms` | 1.93e-08 | 0.00e+00 | 1.57e-08 | 1.43e-07 | 2.71e-08 | 4.65e-07 | **PASS** |
+| `ctrl_int_20ms` | 8.18e-09 | 0.00e+00 | 2.18e-08 | 3.35e-07 | 2.77e-08 | 1.11e-06 | **PASS** |
+| `substep_1_of_4` | 1.93e-08 | 0.00e+00 | 1.57e-08 | 1.43e-07 | 2.71e-08 | 4.65e-07 | **PASS** |
+| `substep_2_of_4` | 4.84e-09 | 0.00e+00 | 2.99e-08 | 2.46e-07 | 2.55e-08 | 6.40e-07 | **PASS** |
+| `substep_3_of_4` | 6.88e-09 | 0.00e+00 | 1.90e-08 | 1.98e-07 | 1.63e-08 | 7.57e-07 | **PASS** |
+| `substep_4_of_4` | 8.18e-09 | 0.00e+00 | 2.18e-08 | 3.35e-07 | 2.77e-08 | 1.11e-06 | **PASS** |
 
 ### Actuator Verification
 - Torques $\text{ctrl}[0..13]$ are transmitted directly to joint DOFs 6..19: $qfrc_{\text{actuator}}[6..19] = \text{ctrl}[0..13]$.
 - Clamping to `actuator_forcerange` $[-1.06755, 1.06755]$ matches MuJoCo C implementation exactly.
-- Holding $\text{ctrl}$ constant across 4 physics substeps of 5 ms matches CPU `mj_step` across the 20 ms policy interval to $8.18 \times 10^{-9}$ m and $2.77 \times 10^{-8}$ rad.
+- Holding $\text{ctrl}$ constant across 4 physics substeps of 5 ms matches CPU `mj_step` across the 20 ms policy interval to $8.18 \times 10^{-9}$ m and $2.77 \times 10^{-8}$ rad. Every intermediate substep is independently evaluated against a step-by-step CPU reference.
 - Mutual exclusivity: supplying both `ctrl` and `f_smooth` simultaneously raises `ValueError`, strictly preventing actuator double-counting.
+- Harness failure path verified: CPU tensor stubs with deliberate metre-scale errors trigger 38 trajectory violations and 32 actuator violations, causing the evaluator command to exit nonzero.
 
 ---
 
