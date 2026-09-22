@@ -1864,6 +1864,16 @@ kernel void kernel_integrate_implicit_fast(
         return;
     }
 
+    // Current orientation quaternion (w, x, y, z)
+    float w1 = qp[3], x1 = qp[4], y1 = qp[5], z1 = qp[6];
+    float q1_sq = w1 * w1 + x1 * x1 + y1 * y1 + z1 * z1;
+    if (q1_sq < 1e-8f || q1_sq > 1e8f || !isfinite(q1_sq)) {
+        integration_status_out[b_idx] = -3; // Degenerate orientation input error
+        for (int i = 0; i < 21; ++i) { qpos_out[b_idx * 21 + i] = NAN; }
+        for (int i = 0; i < 20; ++i) { qvel_out[b_idx * 20 + i] = NAN; }
+        return;
+    }
+
     // 3. Velocity update: v_{t+h} = v_t + dt * a
     float v_next[20];
     for (int i = 0; i < 20; ++i) {
@@ -1896,20 +1906,11 @@ kernel void kernel_integrate_implicit_fast(
         z2 = 0.5f * dt * omega.z;
     }
 
-    // Current unit quaternion (w, x, y, z)
-    float w1 = qp[3], x1 = qp[4], y1 = qp[5], z1 = qp[6];
-
     // Hamilton product: q_new = q_curr * dq
     float w_new = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2;
     float x_new = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2;
     float y_new = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2;
     float z_new = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2;
-
-    float q_invnorm = rsqrt(max(1e-14f, w_new * w_new + x_new * x_new + y_new * y_new + z_new * z_new));
-    w_new *= q_invnorm;
-    x_new *= q_invnorm;
-    y_new *= q_invnorm;
-    z_new *= q_invnorm;
 
     // Hinge joints (joints 1 to 14, DOFs 6..19 -> qpos 7..20)
     float jnt_next[14];
@@ -1917,7 +1918,39 @@ kernel void kernel_integrate_implicit_fast(
         jnt_next[j] = qp[7 + j] + dt * v_next[6 + j];
     }
 
-    // 5. Write outputs (safe for in-place update where qpos_out == qpos_in or qvel_out == qvel_in)
+    // 5. Post-arithmetic validation: detect overflow or non-finite computed coordinates/velocities
+    bool finite_computed = true;
+    for (int i = 0; i < 20; ++i) {
+        if (!isfinite(v_next[i])) { finite_computed = false; break; }
+    }
+    for (int i = 0; i < 3; ++i) {
+        if (!isfinite(p_next[i])) { finite_computed = false; break; }
+    }
+    for (int j = 0; j < 14; ++j) {
+        if (!isfinite(jnt_next[j])) { finite_computed = false; break; }
+    }
+    if (!finite_computed) {
+        integration_status_out[b_idx] = -2; // Arithmetic overflow in state advancement
+        for (int i = 0; i < 21; ++i) { qpos_out[b_idx * 21 + i] = NAN; }
+        for (int i = 0; i < 20; ++i) { qvel_out[b_idx * 20 + i] = NAN; }
+        return;
+    }
+
+    float q_new_sq = w_new * w_new + x_new * x_new + y_new * y_new + z_new * z_new;
+    if (q_new_sq < 1e-8f || !isfinite(q_new_sq)) {
+        integration_status_out[b_idx] = -3; // Degenerate orientation post-integration
+        for (int i = 0; i < 21; ++i) { qpos_out[b_idx * 21 + i] = NAN; }
+        for (int i = 0; i < 20; ++i) { qvel_out[b_idx * 20 + i] = NAN; }
+        return;
+    }
+
+    float q_invnorm = rsqrt(q_new_sq);
+    w_new *= q_invnorm;
+    x_new *= q_invnorm;
+    y_new *= q_invnorm;
+    z_new *= q_invnorm;
+
+    // 6. Write outputs (safe for in-place update where qpos_out == qpos_in or qvel_out == qvel_in)
     device float* qp_out = qpos_out + b_idx * 21;
     device float* qv_out = qvel_out + b_idx * 20;
 

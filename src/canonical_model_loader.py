@@ -7,7 +7,7 @@ and verifies that only asserted contact pairs (terrain vs foot geoms) are active
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 import numpy as np
 import mujoco
 
@@ -243,3 +243,43 @@ def verify_asserted_contacts(canonical: CanonicalMicroDuckModel):
             assert len(right_contacts) == 0, (
                 f"State 'single_support' expected 0 right foot contacts, got {len(right_contacts)}"
             )
+
+
+def create_matching_cpu_model(
+    canonical: CanonicalMicroDuckModel,
+    d_npz: Dict[str, np.ndarray],
+    xml_path: Optional[Path] = None,
+) -> mujoco.MjModel:
+    """Constructs a fresh CPU MjModel exactly matching scenario-randomized parameters.
+
+    Copies per-world body masses, CoM offsets (ipos), armature, and geom friction
+    so that CPU reference evaluation mirrors GPU inputs down to numerical precision.
+    """
+    path = xml_path or CANONICAL_XML_PATH
+    m = mujoco.MjModel.from_xml_path(str(path))
+    if "per_world_mass" in d_npz and np.any(d_npz["per_world_mass"] != 0):
+        m.body_mass[:] = d_npz["per_world_mass"]
+    if "per_world_ipos" in d_npz and np.any(d_npz["per_world_ipos"] != 0):
+        m.body_ipos[:] = d_npz["per_world_ipos"]
+    if "per_world_armature" in d_npz and np.any(d_npz["per_world_armature"] != 0):
+        m.dof_armature[:] = d_npz["per_world_armature"]
+    if "contact_friction" in d_npz and len(d_npz["contact_friction"]) > 0:
+        fric = float(d_npz["contact_friction"][0, 0])
+        m.geom_friction[canonical.terrain_geom_id, 0] = fric
+        m.geom_friction[canonical.left_foot_geom_id, 0] = fric
+        m.geom_friction[canonical.right_foot_geom_id, 0] = fric
+    return m
+
+
+def create_matching_cpu_data(
+    m: mujoco.MjModel,
+    d_npz: Dict[str, np.ndarray],
+) -> mujoco.MjData:
+    """Creates a fresh MjData instance initialized with scenario qpos, qvel, and qfrc_applied."""
+    d = mujoco.MjData(m)
+    d.qpos[:] = d_npz["qpos"]
+    d.qvel[:] = d_npz["qvel"]
+    if "qfrc_applied" in d_npz and np.any(d_npz["qfrc_applied"] != 0):
+        d.qfrc_applied[:] = d_npz["qfrc_applied"]
+    return d
+

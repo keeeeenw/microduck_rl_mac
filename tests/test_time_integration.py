@@ -22,8 +22,16 @@ import numpy as np
 import pytest
 import torch
 
-from src.canonical_model_loader import load_canonical_model
+from src.canonical_model_loader import (
+    CanonicalMicroDuckModel,
+    create_matching_cpu_data,
+    create_matching_cpu_model,
+    load_canonical_model,
+)
 from src.representative_physics_slice import RepresentativePhysicsSlice
+
+SCENARIOS_ALL_25 = sorted([f.stem for f in (PROJECT_ROOT / "corpus").glob("*.npz")])
+assert len(SCENARIOS_ALL_25) == 25, f"Expected 25 scenarios, found {len(SCENARIOS_ALL_25)}"
 
 
 def compute_so3_distance(q1: np.ndarray, q2: np.ndarray) -> float:
@@ -271,99 +279,205 @@ def test_integrator_in_place_safety():
     assert np.allclose(qp[0, 0:3].cpu().numpy(), expected_p, atol=1e-6)
 
 
+def test_integrator_caller_output_buffer_validation():
+    """Verifies that caller-provided output buffers and upstream_status are strictly validated."""
+    ps = RepresentativePhysicsSlice(batch_size=2)
+    dt = 0.005
+
+    qp = torch.zeros((2, 21), dtype=torch.float32, device=ps.device)
+    qp[:, 3] = 1.0
+    qv = torch.zeros((2, 20), dtype=torch.float32, device=ps.device)
+    qa = torch.zeros((2, 20), dtype=torch.float32, device=ps.device)
+    stat = torch.zeros((2,), dtype=torch.int32, device=ps.device)
+
+    # 1. Invalid qpos_out shape
+    with pytest.raises(ValueError, match="Expected qpos_out shape"):
+        bad_qp = torch.zeros((2, 10), dtype=torch.float32, device=ps.device)
+        ps.integrate_implicit_fast(qp, qv, qa, stat, qpos_out=bad_qp)
+
+    # 2. Invalid qvel_out shape
+    with pytest.raises(ValueError, match="Expected qvel_out shape"):
+        bad_qv = torch.zeros((2, 10), dtype=torch.float32, device=ps.device)
+        ps.integrate_implicit_fast(qp, qv, qa, stat, qvel_out=bad_qv)
+
+    # 3. Invalid status_out shape
+    with pytest.raises(ValueError, match="Expected status_out shape"):
+        bad_stat = torch.zeros((2, 2), dtype=torch.int32, device=ps.device)
+        ps.integrate_implicit_fast(qp, qv, qa, stat, status_out=bad_stat)
+
+    # 4. Invalid dtypes (MPS supports float32, float16, int32, int64)
+    with pytest.raises(TypeError, match="qpos_out must be float32"):
+        bad_qp_dtype = torch.zeros((2, 21), dtype=torch.float16, device=ps.device)
+        ps.integrate_implicit_fast(qp, qv, qa, stat, qpos_out=bad_qp_dtype)
+
+    with pytest.raises(TypeError, match="status_out must be int32"):
+        bad_stat_dtype = torch.zeros((2,), dtype=torch.int64, device=ps.device)
+        ps.integrate_implicit_fast(qp, qv, qa, stat, status_out=bad_stat_dtype)
+
+    # 5. Invalid device (CPU tensor passed when device is MPS)
+    with pytest.raises(ValueError, match="must be on device"):
+        bad_dev = torch.zeros((2, 21), dtype=torch.float32, device="cpu")
+        ps.integrate_implicit_fast(qp, qv, qa, stat, qpos_out=bad_dev)
+
+    # 5. Non-contiguous buffer
+    with pytest.raises(ValueError, match="must be contiguous"):
+        non_contig = torch.zeros((2, 42), dtype=torch.float32, device=ps.device)[:, ::2]
+        ps.integrate_implicit_fast(qp, qv, qa, stat, qpos_out=non_contig)
+
+    # 6. Upstream status shape (B, 2) rejection
+    with pytest.raises(ValueError, match="Expected upstream_status shape"):
+        bad_up_stat = torch.zeros((2, 2), dtype=torch.int32, device=ps.device)
+        ps.integrate_implicit_fast(qp, qv, qa, bad_up_stat)
+
+
+def test_integrator_storage_aliasing_safety():
+    """Verifies that exact in-place updates are permitted while unsafe overlapping views are rejected."""
+    ps = RepresentativePhysicsSlice(batch_size=2)
+    dt = 0.005
+
+    qp = torch.zeros((2, 21), dtype=torch.float32, device=ps.device)
+    qp[:, 3] = 1.0
+    qv = torch.zeros((2, 20), dtype=torch.float32, device=ps.device)
+    qa = torch.zeros((2, 20), dtype=torch.float32, device=ps.device)
+    stat = torch.zeros((2,), dtype=torch.int32, device=ps.device)
+
+    # Exact in-place must succeed
+    qp_ret, qv_ret, stat_ret = ps.integrate_implicit_fast(qp, qv, qa, stat, dt=dt, qpos_out=qp, qvel_out=qv, status_out=stat)
+    assert qp_ret.data_ptr() == qp.data_ptr()
+    assert qv_ret.data_ptr() == qv.data_ptr()
+
+    # Partial / shifted memory overlap must be rejected
+    flat = torch.zeros(100, dtype=torch.float32, device=ps.device)
+    qp1 = flat[0:21].unsqueeze(0)
+    qp1[:, 3] = 1.0
+    qp2 = flat[1:22].unsqueeze(0)  # Overlaps with qp1 by 20 elements
+    qv1 = torch.zeros((1, 20), dtype=torch.float32, device=ps.device)
+    qa1 = torch.zeros((1, 20), dtype=torch.float32, device=ps.device)
+    stat1 = torch.zeros((1,), dtype=torch.int32, device=ps.device)
+
+    with pytest.raises(ValueError, match="Unsafe memory aliasing / partial overlap"):
+        ps.integrate_implicit_fast(qp1, qv1, qa1, stat1, qpos_out=qp2)
+
+    # Cross-buffer aliasing between qpos_out and qvel_out must be rejected
+    out_buf = torch.zeros((1, 21), dtype=torch.float32, device=ps.device)
+    with pytest.raises(ValueError, match="Unsafe memory aliasing / partial overlap"):
+        ps.integrate_implicit_fast(qp1, qv1, qa1, stat1, qpos_out=out_buf, qvel_out=out_buf[:, :20])
+
+
+def test_integrator_state_overflow_and_neighbor_isolation():
+    """Verifies that arithmetic overflow produces status -2 with NANs, isolating neighboring worlds."""
+    ps = RepresentativePhysicsSlice(batch_size=2)
+    dt = 0.005
+
+    qp = torch.zeros((2, 21), dtype=torch.float32, device=ps.device)
+    qp[:, 3] = 1.0
+    qv = torch.zeros((2, 20), dtype=torch.float32, device=ps.device)
+    qa = torch.zeros((2, 20), dtype=torch.float32, device=ps.device)
+    stat = torch.zeros((2,), dtype=torch.int32, device=ps.device)
+
+    # World 0: valid normal linear translation
+    qv[0, 0:3] = torch.tensor([1.0, 2.0, 3.0], device=ps.device)
+    qa[0, 0:3] = torch.tensor([0.0, 0.0, -9.81], device=ps.device)
+
+    # World 1: finite float32 max velocity and acceleration -> overflow on addition
+    qv[1] = 3.4e38
+    qa[1] = 3.4e38
+
+    qp_out, qv_out, stat_out = ps.integrate_implicit_fast(qp, qv, qa, stat, dt=dt)
+    torch.mps.synchronize()
+
+    # World 0 must advance correctly with status 0
+    assert stat_out[0].item() == 0
+    expected_v0 = np.array([1.0, 2.0, 3.0 - dt * 9.81])
+    expected_p0 = dt * expected_v0
+    assert np.allclose(qv_out[0, 0:3].cpu().numpy(), expected_v0, atol=1e-5)
+    assert np.allclose(qp_out[0, 0:3].cpu().numpy(), expected_p0, atol=1e-5)
+
+    # World 1 must fail safely with status -2 (arithmetic overflow) and NANs
+    assert stat_out[1].item() == -2
+    assert torch.all(torch.isnan(qp_out[1]))
+    assert torch.all(torch.isnan(qv_out[1]))
+
+
+def test_integrator_degenerate_quaternion_and_neighbor_isolation():
+    """Verifies that degenerate quaternion produces status -3 with NANs, isolating neighboring worlds."""
+    ps = RepresentativePhysicsSlice(batch_size=2)
+    dt = 0.005
+
+    qp = torch.zeros((2, 21), dtype=torch.float32, device=ps.device)
+    qp[0, 3] = 1.0  # World 0: valid unit quaternion
+    qp[1, 3:7] = 0.0  # World 1: degenerate zero quaternion
+    qv = torch.zeros((2, 20), dtype=torch.float32, device=ps.device)
+    qa = torch.zeros((2, 20), dtype=torch.float32, device=ps.device)
+    stat = torch.zeros((2,), dtype=torch.int32, device=ps.device)
+
+    qp_out, qv_out, stat_out = ps.integrate_implicit_fast(qp, qv, qa, stat, dt=dt)
+    torch.mps.synchronize()
+
+    # World 0 must succeed
+    assert stat_out[0].item() == 0
+    assert torch.all(torch.isfinite(qp_out[0]))
+    assert torch.all(torch.isfinite(qv_out[0]))
+
+    # World 1 must fail safely with status -3 and NANs
+    assert stat_out[1].item() == -3
+    assert torch.all(torch.isnan(qp_out[1]))
+    assert torch.all(torch.isnan(qv_out[1]))
+
+
 # ==============================================================================
 # Stage 2: Common-State One-Step Parity Across All 25 Scenarios
 # ==============================================================================
 
-def test_autonomous_one_step_airborne_scenarios():
-    """Verifies machine-precision one-step parity for airborne / non-contact scenarios."""
+@pytest.mark.parametrize("sc_name", SCENARIOS_ALL_25)
+def test_autonomous_one_step_all_25_scenarios(sc_name):
+    """Verifies one-step 5 ms parity against matched CPU models across all 25 corpus scenarios."""
     ps = RepresentativePhysicsSlice(batch_size=1)
-    c = load_canonical_model()
-    m = c.model
-    d = mujoco.MjData(m)
+    canonical = load_canonical_model()
 
-    airborne_cases = ["airborne", "near_contact_separation", "boundary_separated_2mm"]
-    corpus_dir = Path("corpus")
+    fpath = Path("corpus") / f"{sc_name}.npz"
+    assert fpath.exists(), f"Required fixture {fpath} does not exist"
+    d_npz = dict(np.load(fpath))
 
-    for case_name in airborne_cases:
-        fpath = corpus_dir / f"{case_name}.npz"
-        if not fpath.exists():
-            continue
-        data = np.load(fpath)
-        qpos = data["qpos"].copy()
-        qvel = data["qvel"].copy()
+    # Matched CPU reference model & fresh data
+    m_matched = create_matching_cpu_model(canonical, d_npz)
+    d_matched = create_matching_cpu_data(m_matched, d_npz)
+    mujoco.mj_step(m_matched, d_matched)
 
-        d.qpos[:] = qpos
-        d.qvel[:] = qvel
-        mujoco.mj_step(m, d)
+    qp_t = torch.from_numpy(d_npz["qpos"].astype(np.float32)).unsqueeze(0).to(ps.device)
+    qv_t = torch.from_numpy(d_npz["qvel"].astype(np.float32)).unsqueeze(0).to(ps.device)
+    f_smooth = (
+        torch.from_numpy(d_npz["qfrc_smooth"].astype(np.float32)).unsqueeze(0).to(ps.device)
+        if ("qfrc_applied" in d_npz and np.any(d_npz["qfrc_applied"] != 0))
+        else None
+    )
+    pwm = torch.from_numpy(d_npz["per_world_mass"].astype(np.float32)).unsqueeze(0).to(ps.device) if "per_world_mass" in d_npz and np.any(d_npz["per_world_mass"] != 0) else None
+    pwi = torch.from_numpy(d_npz["per_world_ipos"].astype(np.float32)).unsqueeze(0).to(ps.device) if "per_world_ipos" in d_npz and np.any(d_npz["per_world_ipos"] != 0) else None
+    pwa = torch.from_numpy(d_npz["per_world_armature"].astype(np.float32)).unsqueeze(0).to(ps.device) if "per_world_armature" in d_npz and np.any(d_npz["per_world_armature"] != 0) else None
 
-        qp_t = torch.from_numpy(qpos.astype(np.float32)).unsqueeze(0).to(ps.device)
-        qv_t = torch.from_numpy(qvel.astype(np.float32)).unsqueeze(0).to(ps.device)
+    f_tensor = None
+    if "randomized_friction" in sc_name and int(d_npz["ncon"]) > 0:
+        f_tensor = torch.from_numpy(d_npz["contact_friction"][:, :2].astype(np.float32)).unsqueeze(0).to(ps.device)
 
-        step_res = ps.step_autonomous(qp_t, qv_t, dt=0.005)
-        torch.mps.synchronize()
+    step_res = ps.step_autonomous(
+        qp_t, qv_t, f_smooth=f_smooth, friction=f_tensor,
+        per_world_mass=pwm, per_world_ipos=pwi, per_world_armature=pwa,
+        max_iters=200, tol=1e-5, dt=0.005
+    )
+    torch.mps.synchronize()
 
-        qp_gpu = step_res.qpos[0].cpu().numpy()
-        qv_gpu = step_res.qvel[0].cpu().numpy()
+    assert step_res.integration_status[0].item() == 0, f"{sc_name} failed integration"
 
-        metrics = compute_separated_metrics(qp_gpu, qv_gpu, d.qpos, d.qvel)
+    qp_gpu = step_res.qpos[0].cpu().numpy()
+    qv_gpu = step_res.qvel[0].cpu().numpy()
+    metrics = compute_separated_metrics(qp_gpu, qv_gpu, d_matched.qpos, d_matched.qvel)
 
-        assert metrics["pos_err"] < 1e-5, f"{case_name} pos_err {metrics['pos_err']:.2e} >= 1e-5 m"
-        assert metrics["so3_err"] < 1e-5, f"{case_name} so3_err {metrics['so3_err']:.2e} >= 1e-5 rad"
-        assert metrics["linvel_err"] < 1e-4, f"{case_name} linvel_err {metrics['linvel_err']:.2e} >= 1e-4 m/s"
-        assert metrics["angvel_err"] < 1e-4, f"{case_name} angvel_err {metrics['angvel_err']:.2e} >= 1e-4 rad/s"
-        assert metrics["jnt_pos_err"] < 1e-5, f"{case_name} jnt_pos_err {metrics['jnt_pos_err']:.2e} >= 1e-5 rad"
-        assert metrics["jnt_vel_err"] < 1e-4, f"{case_name} jnt_vel_err {metrics['jnt_vel_err']:.2e} >= 1e-4 rad/s"
-        assert step_res.integration_status[0].item() == 0
-
-
-def test_autonomous_one_step_contact_scenarios():
-    """Verifies one-step physical gates across realistic contact scenarios."""
-    ps = RepresentativePhysicsSlice(batch_size=1)
-    c = load_canonical_model()
-    m = c.model
-    d = mujoco.MjData(m)
-
-    contact_cases = [
-        "nominal_standing_realistic",
-        "toe_only_contact_realistic",
-        "heel_only_contact_realistic",
-        "sliding_lateral_velocity",
-        "boundary_onset_exact",
-    ]
-    corpus_dir = Path("corpus")
-
-    for case_name in contact_cases:
-        fpath = corpus_dir / f"{case_name}.npz"
-        if not fpath.exists():
-            continue
-        data = np.load(fpath)
-        qpos = data["qpos"].copy()
-        qvel = data["qvel"].copy()
-
-        d.qpos[:] = qpos
-        d.qvel[:] = qvel
-        mujoco.mj_step(m, d)
-
-        qp_t = torch.from_numpy(qpos.astype(np.float32)).unsqueeze(0).to(ps.device)
-        qv_t = torch.from_numpy(qvel.astype(np.float32)).unsqueeze(0).to(ps.device)
-
-        step_res = ps.step_autonomous(qp_t, qv_t, dt=0.005)
-        torch.mps.synchronize()
-
-        qp_gpu = step_res.qpos[0].cpu().numpy()
-        qv_gpu = step_res.qvel[0].cpu().numpy()
-
-        metrics = compute_separated_metrics(qp_gpu, qv_gpu, d.qpos, d.qvel)
-
-        # Contact one-step gates
-        assert metrics["pos_err"] < 1e-3, f"{case_name} pos_err {metrics['pos_err']:.2e} >= 1e-3 m"
-        assert metrics["so3_err"] < 1e-3, f"{case_name} so3_err {metrics['so3_err']:.2e} >= 1e-3 rad"
-        assert metrics["linvel_err"] < 0.05, f"{case_name} linvel_err {metrics['linvel_err']:.2e} >= 0.05 m/s"
-        assert metrics["angvel_err"] < 0.05, f"{case_name} angvel_err {metrics['angvel_err']:.2e} >= 0.05 rad/s"
-        assert metrics["jnt_pos_err"] < 1e-3, f"{case_name} jnt_pos_err {metrics['jnt_pos_err']:.2e} >= 1e-3 rad"
-        assert metrics["jnt_vel_err"] < 0.05, f"{case_name} jnt_vel_err {metrics['jnt_vel_err']:.2e} >= 0.05 rad/s"
-        assert step_res.integration_status[0].item() == 0
+    assert metrics["pos_err"] < 1e-3, f"{sc_name} pos_err {metrics['pos_err']:.2e} >= 1e-3 m"
+    assert metrics["so3_err"] < 1e-3, f"{sc_name} so3_err {metrics['so3_err']:.2e} >= 1e-3 rad"
+    assert metrics["linvel_err"] < 0.05, f"{sc_name} linvel_err {metrics['linvel_err']:.2e} >= 0.05 m/s"
+    assert metrics["angvel_err"] < 0.05, f"{sc_name} angvel_err {metrics['angvel_err']:.2e} >= 0.05 rad/s"
+    assert metrics["jnt_pos_err"] < 1e-3, f"{sc_name} jnt_pos_err {metrics['jnt_pos_err']:.2e} >= 1e-3 rad"
+    assert metrics["jnt_vel_err"] < 0.05, f"{sc_name} jnt_vel_err {metrics['jnt_vel_err']:.2e} >= 0.05 rad/s"
 
 
 # ==============================================================================
@@ -419,16 +533,14 @@ def test_free_running_airborne_trajectory_20_and_200_steps():
 def test_free_running_nominal_standing_4_and_20_steps():
     """Verifies free-running autonomous standing contact trajectory across 4 steps (20 ms) and 20 steps (100 ms)."""
     ps = RepresentativePhysicsSlice(batch_size=1)
-    c = load_canonical_model()
-    m = c.model
-    d = mujoco.MjData(m)
+    canonical = load_canonical_model()
 
-    data = np.load("corpus/nominal_standing_realistic.npz")
+    data = dict(np.load("corpus/nominal_standing_realistic.npz"))
+    m_matched = create_matching_cpu_model(canonical, data)
+    d_matched = create_matching_cpu_data(m_matched, data)
+
     qpos = data["qpos"].copy()
     qvel = data["qvel"].copy()
-
-    d.qpos[:] = qpos
-    d.qvel[:] = qvel
 
     qp_t = torch.from_numpy(qpos.astype(np.float32)).unsqueeze(0).to(ps.device)
     qv_t = torch.from_numpy(qvel.astype(np.float32)).unsqueeze(0).to(ps.device)
@@ -436,16 +548,19 @@ def test_free_running_nominal_standing_4_and_20_steps():
     rollout = ps.rollout_trajectory(qp_t, qv_t, num_steps=20, dt=0.005)
     torch.mps.synchronize()
 
-    # Step CPU reference
+    # Step CPU reference with matched model
     cpu_qpos = [qpos.copy()]
     cpu_qvel = [qvel.copy()]
     for _ in range(20):
-        mujoco.mj_step(m, d)
-        cpu_qpos.append(d.qpos.copy())
-        cpu_qvel.append(d.qvel.copy())
+        mujoco.mj_step(m_matched, d_matched)
+        cpu_qpos.append(d_matched.qpos.copy())
+        cpu_qvel.append(d_matched.qvel.copy())
 
     gpu_qpos = rollout["qpos"][:, 0, :].cpu().numpy()
     gpu_qvel = rollout["qvel"][:, 0, :].cpu().numpy()
+
+    # Verify integration status throughout rollout
+    assert torch.all(rollout["integration_status"] == 0), "Integration status failure during standing rollout"
 
     # Step 4 (20 ms, 1 control interval)
     m4 = compute_separated_metrics(gpu_qpos[4], gpu_qvel[4], cpu_qpos[4], cpu_qvel[4])
@@ -453,13 +568,17 @@ def test_free_running_nominal_standing_4_and_20_steps():
     assert m4["so3_err"] < 1e-3, f"4-step standing so3_err {m4['so3_err']:.2e} >= 1e-3 rad"
     assert m4["linvel_err"] < 0.05, f"4-step standing linvel_err {m4['linvel_err']:.2e} >= 0.05 m/s"
     assert m4["angvel_err"] < 0.05, f"4-step standing angvel_err {m4['angvel_err']:.2e} >= 0.05 rad/s"
+    assert m4["jnt_pos_err"] < 1e-3, f"4-step standing jnt_pos_err {m4['jnt_pos_err']:.2e} >= 1e-3 rad"
+    assert m4["jnt_vel_err"] < 0.05, f"4-step standing jnt_vel_err {m4['jnt_vel_err']:.2e} >= 0.05 rad/s"
 
-    # Step 20 (100 ms, 5 control intervals)
+    # Step 20 (100 ms, 5 control intervals) - strict 1e-3 m and 1e-3 rad gates enforced
     m20 = compute_separated_metrics(gpu_qpos[20], gpu_qvel[20], cpu_qpos[20], cpu_qvel[20])
-    assert m20["pos_err"] < 5e-3, f"20-step standing pos_err {m20['pos_err']:.2e} >= 5e-3 m"
-    assert m20["so3_err"] < 5e-3, f"20-step standing so3_err {m20['so3_err']:.2e} >= 5e-3 rad"
+    assert m20["pos_err"] < 1e-3, f"20-step standing pos_err {m20['pos_err']:.2e} >= 1e-3 m"
+    assert m20["so3_err"] < 1e-3, f"20-step standing so3_err {m20['so3_err']:.2e} >= 1e-3 rad"
     assert m20["linvel_err"] < 0.05, f"20-step standing linvel_err {m20['linvel_err']:.2e} >= 0.05 m/s"
     assert m20["angvel_err"] < 0.05, f"20-step standing angvel_err {m20['angvel_err']:.2e} >= 0.05 rad/s"
+    assert m20["jnt_pos_err"] < 1e-3, f"20-step standing jnt_pos_err {m20['jnt_pos_err']:.2e} >= 1e-3 rad"
+    assert m20["jnt_vel_err"] < 0.05, f"20-step standing jnt_vel_err {m20['jnt_vel_err']:.2e} >= 0.05 rad/s"
 
 
 def test_free_running_landing_contact_transition():
@@ -645,6 +764,73 @@ def test_control_interval_substepping_parity():
     assert metrics["angvel_err"] < 0.05, f"Control interval angvel_err {metrics['angvel_err']:.2e} >= 0.05 rad/s"
     assert metrics["jnt_pos_err"] < 1e-3, f"Control interval jnt_pos_err {metrics['jnt_pos_err']:.2e} >= 1e-3 rad"
     assert metrics["jnt_vel_err"] < 0.05, f"Control interval jnt_vel_err {metrics['jnt_vel_err']:.2e} >= 0.05 rad/s"
+
+
+def test_forward_autonomous_simultaneous_ctrl_and_fsmooth_rejected():
+    """Verifies that providing both ctrl and f_smooth simultaneously raises ValueError to prevent double counting."""
+    ps = RepresentativePhysicsSlice(batch_size=1)
+    qp = torch.zeros((1, 21), dtype=torch.float32, device=ps.device)
+    qp[0, 3] = 1.0
+    qv = torch.zeros((1, 20), dtype=torch.float32, device=ps.device)
+    ctrl = torch.zeros((1, 14), dtype=torch.float32, device=ps.device)
+    f_sm = torch.zeros((1, 20), dtype=torch.float32, device=ps.device)
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        ps.forward_autonomous(qp, qv, ctrl=ctrl, f_smooth=f_sm)
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        ps.step_autonomous(qp, qv, ctrl=ctrl, f_smooth=f_sm)
+
+
+def test_substep_diagnostic_history_ownership():
+    """Verifies that substep diagnostic outputs do not alias across iterations and match sequential steps."""
+    ps = RepresentativePhysicsSlice(batch_size=1)
+    canonical = load_canonical_model()
+
+    # Drop onset scenario: starts airborne at step 0 (nefc=0), establishing contact during substeps
+    data = dict(np.load("corpus/nominal_standing_realistic.npz"))
+    qp_drop = data["qpos"].copy()
+    qp_drop[2] += 0.005  # 5 mm drop: contacts change across substeps
+    qv_drop = np.zeros(20, dtype=np.float32)
+    ctrl = torch.zeros((1, 14), dtype=torch.float32, device=ps.device)
+
+    qp_t = torch.from_numpy(qp_drop.astype(np.float32)).unsqueeze(0).to(ps.device)
+    qv_t = torch.from_numpy(qv_drop).unsqueeze(0).to(ps.device)
+
+    # 1. Run 4 substeps via step_control_interval
+    qp_final, qv_final, substep_outs = ps.step_control_interval(
+        qp_t, qv_t, ctrl, num_substeps=4, dt=0.005
+    )
+    torch.mps.synchronize()
+
+    assert len(substep_outs) == 4
+
+    # 2. Run 4 independent sequential steps
+    qp_seq = qp_t.clone()
+    qv_seq = qv_t.clone()
+    seq_outs = []
+    for _ in range(4):
+        s_res = ps.step_autonomous(qp_seq, qv_seq, ctrl=ctrl, dt=0.005)
+        qp_seq = s_res.qpos.clone()
+        qv_seq = s_res.qvel.clone()
+        seq_outs.append(s_res.clone())
+    torch.mps.synchronize()
+
+    # 3. Verify history integrity:
+    # Substep outputs must not alias memory with each other
+    for i in range(3):
+        for j in range(i + 1, 4):
+            assert substep_outs[i].qpos.data_ptr() != substep_outs[j].qpos.data_ptr()
+            assert substep_outs[i].physics_outputs.J.data_ptr() != substep_outs[j].physics_outputs.J.data_ptr()
+            assert substep_outs[i].physics_outputs.lambda_force.data_ptr() != substep_outs[j].physics_outputs.lambda_force.data_ptr()
+
+    # Substep outputs must match sequential execution at every substep
+    for s in range(4):
+        assert torch.allclose(substep_outs[s].qpos, seq_outs[s].qpos, atol=1e-6)
+        assert torch.allclose(substep_outs[s].qvel, seq_outs[s].qvel, atol=1e-6)
+        assert substep_outs[s].integration_status.item() == seq_outs[s].integration_status.item()
+        assert substep_outs[s].nefc.item() == seq_outs[s].nefc.item()
+        assert torch.allclose(substep_outs[s].physics_outputs.lambda_force, seq_outs[s].physics_outputs.lambda_force, atol=1e-5)
 
 
 # ==============================================================================

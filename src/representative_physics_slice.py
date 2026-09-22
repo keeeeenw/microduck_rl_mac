@@ -95,6 +95,30 @@ class PhysicsSliceOutputs:
     qacc: torch.Tensor            # (B, 20)
     solver_status: torch.Tensor   # (B,) int32
 
+    def clone(self) -> "PhysicsSliceOutputs":
+        return PhysicsSliceOutputs(
+            body_xpos=self.body_xpos.clone(),
+            body_xmat=self.body_xmat.clone(),
+            body_xipos=self.body_xipos.clone(),
+            body_ximat=self.body_ximat.clone(),
+            subtree_com=self.subtree_com.clone(),
+            geom_xpos=self.geom_xpos.clone(),
+            geom_xmat=self.geom_xmat.clone(),
+            contact_pos=self.contact_pos.clone(),
+            contact_dist=self.contact_dist.clone(),
+            contact_normal=self.contact_normal.clone(),
+            contact_body=self.contact_body.clone(),
+            ncon=self.ncon.clone(),
+            overflow_flag=self.overflow_flag.clone(),
+            M_eff=self.M_eff.clone(),
+            L_factor=self.L_factor.clone(),
+            M_inv=self.M_inv.clone(),
+            qfrc_bias=self.qfrc_bias.clone(),
+            qfrc_constraint=self.qfrc_constraint.clone(),
+            qacc=self.qacc.clone(),
+            solver_status=self.solver_status.clone(),
+        )
+
 
 @dataclass
 class AutonomousPhysicsSliceOutputs:
@@ -134,6 +158,44 @@ class AutonomousPhysicsSliceOutputs:
     solver_status: torch.Tensor         # (B,) int32
     actual_iters: torch.Tensor          # (B,) int32
     dual_residual: torch.Tensor         # (B,) float32
+    integration_status: Optional[torch.Tensor] = None
+
+    def clone(self) -> "AutonomousPhysicsSliceOutputs":
+        return AutonomousPhysicsSliceOutputs(
+            body_xpos=self.body_xpos.clone(),
+            body_xmat=self.body_xmat.clone(),
+            body_xipos=self.body_xipos.clone(),
+            body_ximat=self.body_ximat.clone(),
+            subtree_com=self.subtree_com.clone(),
+            geom_xpos=self.geom_xpos.clone(),
+            geom_xmat=self.geom_xmat.clone(),
+            contact_pos=self.contact_pos.clone(),
+            contact_dist=self.contact_dist.clone(),
+            contact_normal=self.contact_normal.clone(),
+            contact_body=self.contact_body.clone(),
+            contact_geom=self.contact_geom.clone(),
+            ncon=self.ncon.clone(),
+            contact_overflow=self.contact_overflow.clone(),
+            J=self.J.clone(),
+            aref=self.aref.clone(),
+            R=self.R.clone(),
+            efc_type=self.efc_type.clone(),
+            nefc=self.nefc.clone(),
+            assembly_overflow=self.assembly_overflow.clone(),
+            M_eff=self.M_eff.clone(),
+            L_factor=self.L_factor.clone(),
+            cholesky_status=self.cholesky_status.clone(),
+            qfrc_bias=self.qfrc_bias.clone(),
+            qfrc_actuator=self.qfrc_actuator.clone(),
+            f_smooth=self.f_smooth.clone(),
+            lambda_force=self.lambda_force.clone(),
+            qfrc_constraint=self.qfrc_constraint.clone(),
+            qacc=self.qacc.clone(),
+            solver_status=self.solver_status.clone(),
+            actual_iters=self.actual_iters.clone(),
+            dual_residual=self.dual_residual.clone(),
+            integration_status=self.integration_status.clone() if self.integration_status is not None else None,
+        )
 
 
 @dataclass
@@ -142,6 +204,19 @@ class AutonomousStepOutputs:
     qvel: torch.Tensor                  # (B, 20) advanced velocities
     integration_status: torch.Tensor    # (B,) int32
     physics_outputs: AutonomousPhysicsSliceOutputs
+
+    def __getattr__(self, name: str):
+        if name != "physics_outputs" and hasattr(self.physics_outputs, name):
+            return getattr(self.physics_outputs, name)
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
+    def clone(self) -> "AutonomousStepOutputs":
+        return AutonomousStepOutputs(
+            qpos=self.qpos.clone(),
+            qvel=self.qvel.clone(),
+            integration_status=self.integration_status.clone(),
+            physics_outputs=self.physics_outputs.clone(),
+        )
 
 
 class RepresentativePhysicsSlice:
@@ -159,6 +234,14 @@ class RepresentativePhysicsSlice:
         self.nconmax = nconmax
         self.canonical = canonical or load_canonical_model()
         self.m = self.canonical.model
+
+        # Verify zero-derivative model preconditions for ImplicitFast state advancement
+        if not np.all(self.m.dof_damping == 0.0):
+            raise NotImplementedError("RepresentativePhysicsSlice requires zero dof_damping (unsupported velocity derivative)")
+        if self.m.opt.viscosity != 0.0 or self.m.opt.density != 0.0:
+            raise NotImplementedError("RepresentativePhysicsSlice requires zero fluid viscosity/density")
+        if not np.all(self.m.actuator_biastype == 0):
+            raise NotImplementedError("RepresentativePhysicsSlice requires mjBIAS_NONE (zero actuator bias derivatives)")
 
         # Compile Metal shaders
         self.km = MetalKernelManager(SHADER_PATH)
@@ -1015,7 +1098,13 @@ class RepresentativePhysicsSlice:
             per_world_armature=per_world_armature,
         )
 
-        # 3. Smooth forces: actuator forces + external/smooth forces + native bias
+        # 3. Smooth forces: actuator forces vs complete external/smooth forces vs native bias
+        if ctrl is not None and f_smooth is not None:
+            raise ValueError(
+                "ctrl and f_smooth are mutually exclusive to prevent accidental actuator double-counting. "
+                "Supply either direct motor ctrl or complete f_smooth, not both."
+            )
+
         qfrc_act = torch.zeros((B, 20), dtype=torch.float32, device=self.device)
         if ctrl is not None:
             if not isinstance(ctrl, torch.Tensor):
@@ -1032,17 +1121,17 @@ class RepresentativePhysicsSlice:
                 self.actuator_forcerange[:, 1],
             )
             qfrc_act[:, 6:20] = ctrl_clamped
-
-        if f_smooth is None:
             f_smooth_tensor = qfrc_act - self.qfrc_bias
-        else:
+        elif f_smooth is not None:
             if not isinstance(f_smooth, torch.Tensor):
                 raise TypeError(f"f_smooth must be torch.Tensor, got {type(f_smooth)}")
             if f_smooth.device.type != self.device.type or f_smooth.dtype != torch.float32:
                 raise ValueError(f"f_smooth must be float32 on {self.device.type}")
             if f_smooth.shape != (B, 20):
                 raise ValueError(f"Expected f_smooth shape ({B}, 20), got {f_smooth.shape}")
-            f_smooth_tensor = (f_smooth + qfrc_act).contiguous()
+            f_smooth_tensor = f_smooth.contiguous()
+        else:
+            f_smooth_tensor = -self.qfrc_bias
 
         # 4. Cholesky Factorization: factorize M_eff -> L_factor
         _, cholesky_status = self.compute_native_cholesky_solve(
@@ -1161,8 +1250,10 @@ class RepresentativePhysicsSlice:
             raise TypeError("All inputs must be torch.Tensor instances")
         if qpos.device.type != self.device.type or qvel.device.type != self.device.type or qacc.device.type != self.device.type or upstream_status.device.type != self.device.type:
             raise ValueError(f"All inputs must be on device {self.device.type}")
-        if qpos.dtype != torch.float32 or qvel.dtype != torch.float32 or qacc.dtype != torch.float32 or upstream_status.dtype != torch.int32:
-            raise TypeError("qpos, qvel, qacc must be float32 and upstream_status must be int32")
+        if qpos.dtype != torch.float32 or qvel.dtype != torch.float32 or qacc.dtype != torch.float32:
+            raise TypeError("qpos, qvel, qacc must be float32")
+        if upstream_status.dtype != torch.int32:
+            raise TypeError("upstream_status must be int32")
         if qpos.ndim != 2 or qpos.shape[1] != 21:
             raise ValueError(f"Expected qpos shape (B, 21), got {qpos.shape}")
         if qvel.ndim != 2 or qvel.shape[1] != 20:
@@ -1170,12 +1261,91 @@ class RepresentativePhysicsSlice:
         if qacc.ndim != 2 or qacc.shape[1] != 20:
             raise ValueError(f"Expected qacc shape (B, 20), got {qacc.shape}")
         B = qpos.shape[0]
-        if qvel.shape[0] != B or qacc.shape[0] != B or upstream_status.shape[0] != B:
+        if B <= 0:
+            raise ValueError(f"Batch size must be strictly positive, got {B}")
+        if qvel.shape[0] != B or qacc.shape[0] != B:
             raise ValueError("Batch dimensions must match across all inputs")
+        if upstream_status.ndim != 1 or upstream_status.shape != (B,):
+            raise ValueError(f"Expected upstream_status shape ({B},), got {upstream_status.shape}")
         if dt <= 0.0 or not math.isfinite(dt):
             raise ValueError(f"dt must be strictly positive and finite, got {dt}")
 
         self._ensure_batch_size(B)
+
+        # Validate caller-provided output buffers if supplied
+        if qpos_out is not None:
+            if not isinstance(qpos_out, torch.Tensor):
+                raise TypeError(f"qpos_out must be a torch.Tensor, got {type(qpos_out)}")
+            if qpos_out.device.type != self.device.type:
+                raise ValueError(f"qpos_out must be on device {self.device.type}, got {qpos_out.device}")
+            if qpos_out.dtype != torch.float32:
+                raise TypeError(f"qpos_out must be float32, got {qpos_out.dtype}")
+            if qpos_out.shape != (B, 21):
+                raise ValueError(f"Expected qpos_out shape ({B}, 21), got {qpos_out.shape}")
+            if not qpos_out.is_contiguous():
+                raise ValueError("qpos_out must be contiguous")
+
+        if qvel_out is not None:
+            if not isinstance(qvel_out, torch.Tensor):
+                raise TypeError(f"qvel_out must be a torch.Tensor, got {type(qvel_out)}")
+            if qvel_out.device.type != self.device.type:
+                raise ValueError(f"qvel_out must be on device {self.device.type}, got {qvel_out.device}")
+            if qvel_out.dtype != torch.float32:
+                raise TypeError(f"qvel_out must be float32, got {qvel_out.dtype}")
+            if qvel_out.shape != (B, 20):
+                raise ValueError(f"Expected qvel_out shape ({B}, 20), got {qvel_out.shape}")
+            if not qvel_out.is_contiguous():
+                raise ValueError("qvel_out must be contiguous")
+
+        if status_out is not None:
+            if not isinstance(status_out, torch.Tensor):
+                raise TypeError(f"status_out must be a torch.Tensor, got {type(status_out)}")
+            if status_out.device.type != self.device.type:
+                raise ValueError(f"status_out must be on device {self.device.type}, got {status_out.device}")
+            if status_out.dtype != torch.int32:
+                raise TypeError(f"status_out must be int32, got {status_out.dtype}")
+            if status_out.shape != (B,):
+                raise ValueError(f"Expected status_out shape ({B},), got {status_out.shape}")
+            if not status_out.is_contiguous():
+                raise ValueError("status_out must be contiguous")
+
+        # Storage aliasing validation
+        # Supported aliasing: exact in-place (qpos_out == qpos, qvel_out == qvel, status_out == upstream_status).
+        # Arbitrary or partially overlapping views are strictly rejected.
+        def _check_overlap(t1: torch.Tensor, t2: torch.Tensor, name1: str, name2: str, allow_identical: bool = False):
+            p1 = t1.data_ptr()
+            bytes1 = t1.numel() * t1.element_size()
+            p2 = t2.data_ptr()
+            bytes2 = t2.numel() * t2.element_size()
+            if p1 < p2 + bytes2 and p2 < p1 + bytes1:
+                if allow_identical and p1 == p2 and bytes1 == bytes2 and t1.shape == t2.shape and t1.stride() == t2.stride():
+                    return
+                raise ValueError(f"Unsafe memory aliasing / partial overlap detected between {name1} and {name2}")
+
+        if qpos_out is not None:
+            _check_overlap(qpos_out, qpos, "qpos_out", "qpos", allow_identical=True)
+            _check_overlap(qpos_out, qvel, "qpos_out", "qvel", allow_identical=False)
+            _check_overlap(qpos_out, qacc, "qpos_out", "qacc", allow_identical=False)
+            _check_overlap(qpos_out, upstream_status, "qpos_out", "upstream_status", allow_identical=False)
+
+        if qvel_out is not None:
+            _check_overlap(qvel_out, qvel, "qvel_out", "qvel", allow_identical=True)
+            _check_overlap(qvel_out, qpos, "qvel_out", "qpos", allow_identical=False)
+            _check_overlap(qvel_out, qacc, "qvel_out", "qacc", allow_identical=False)
+            _check_overlap(qvel_out, upstream_status, "qvel_out", "upstream_status", allow_identical=False)
+
+        if status_out is not None:
+            _check_overlap(status_out, upstream_status, "status_out", "upstream_status", allow_identical=True)
+            _check_overlap(status_out, qpos, "status_out", "qpos", allow_identical=False)
+            _check_overlap(status_out, qvel, "status_out", "qvel", allow_identical=False)
+            _check_overlap(status_out, qacc, "status_out", "qacc", allow_identical=False)
+
+        if qpos_out is not None and qvel_out is not None:
+            _check_overlap(qpos_out, qvel_out, "qpos_out", "qvel_out", allow_identical=False)
+        if qpos_out is not None and status_out is not None:
+            _check_overlap(qpos_out, status_out, "qpos_out", "status_out", allow_identical=False)
+        if qvel_out is not None and status_out is not None:
+            _check_overlap(qvel_out, status_out, "qvel_out", "status_out", allow_identical=False)
 
         out_qp = self.integrated_qpos if qpos_out is None else qpos_out
         out_qv = self.integrated_qvel if qvel_out is None else qvel_out
@@ -1199,7 +1369,7 @@ class RepresentativePhysicsSlice:
             threads=B,
         )
 
-        return out_qp, out_qv, out_stat
+        return out_qp[:B], out_qv[:B], out_stat[:B]
 
     def step_autonomous(
         self,
@@ -1239,6 +1409,7 @@ class RepresentativePhysicsSlice:
             out.solver_status,
             dt=dt,
         )
+        out.integration_status = int_stat
         return AutonomousStepOutputs(
             qpos=qpos_next,
             qvel=qvel_next,
@@ -1259,7 +1430,7 @@ class RepresentativePhysicsSlice:
         per_world_armature: Optional[torch.Tensor] = None,
         max_iters: int = 100,
         tol: float = 1e-5,
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[AutonomousPhysicsSliceOutputs]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[AutonomousStepOutputs]]:
         """Advances state across one 20 ms control step (default 4 substeps of 5 ms) holding ctrl constant."""
         curr_qp = qpos.clone()
         curr_qv = qvel.clone()
@@ -1280,7 +1451,7 @@ class RepresentativePhysicsSlice:
             )
             curr_qp = step_res.qpos.clone()
             curr_qv = step_res.qvel.clone()
-            substep_outputs.append(step_res.physics_outputs)
+            substep_outputs.append(step_res.clone())
 
         return curr_qp, curr_qv, substep_outputs
 
@@ -1305,6 +1476,7 @@ class RepresentativePhysicsSlice:
         qacc_hist = []
         qfrc_c_hist = []
         status_hist = []
+        int_stat_hist = []
         nefc_hist = []
         iters_hist = []
         dual_res_hist = []
@@ -1334,6 +1506,7 @@ class RepresentativePhysicsSlice:
             qacc_hist.append(step_res.physics_outputs.qacc.clone())
             qfrc_c_hist.append(step_res.physics_outputs.qfrc_constraint.clone())
             status_hist.append(step_res.physics_outputs.solver_status.clone())
+            int_stat_hist.append(step_res.integration_status.clone())
             nefc_hist.append(step_res.physics_outputs.nefc.clone())
             iters_hist.append(step_res.physics_outputs.actual_iters.clone())
             dual_res_hist.append(step_res.physics_outputs.dual_residual.clone())
@@ -1344,6 +1517,7 @@ class RepresentativePhysicsSlice:
             "qacc": torch.stack(qacc_hist, dim=0),           # (num_steps, B, 20)
             "qfrc_constraint": torch.stack(qfrc_c_hist, dim=0), # (num_steps, B, 20)
             "solver_status": torch.stack(status_hist, dim=0),# (num_steps, B)
+            "integration_status": torch.stack(int_stat_hist, dim=0), # (num_steps, B)
             "nefc": torch.stack(nefc_hist, dim=0),           # (num_steps, B)
             "actual_iters": torch.stack(iters_hist, dim=0),  # (num_steps, B)
             "dual_residual": torch.stack(dual_res_hist, dim=0), # (num_steps, B)
