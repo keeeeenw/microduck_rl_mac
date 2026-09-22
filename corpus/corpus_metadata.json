@@ -1,5 +1,5 @@
 {
-  "num_scenarios": 10,
+  "num_scenarios": 25,
   "scenarios": [
     "standing_zero_vel",
     "standing_moving_vel",
@@ -10,7 +10,22 @@
     "nonzero_base_angvel",
     "near_contact_separation",
     "contact_onset",
-    "randomized_model_standing"
+    "randomized_model_standing",
+    "crouched_pose",
+    "asymmetric_pose",
+    "combined_rotation_motion",
+    "high_condition_mass_matrix",
+    "nonzero_applied_force",
+    "nominal_standing_realistic",
+    "boundary_separated_2mm",
+    "boundary_onset_exact",
+    "impedance_transition_shallow",
+    "impedance_transition_mid",
+    "impedance_transition_edge",
+    "toe_only_contact_realistic",
+    "heel_only_contact_realistic",
+    "sliding_lateral_velocity",
+    "randomized_friction_corpus"
   ],
   "nv": 20,
   "nq": 21,

@@ -650,6 +650,458 @@ kernel void kernel_cad_contact_manifold(
 }
 
 // -----------------------------------------------------------------------------
+// 2b. CAD Sole Contact Manifold Kernel V2 (Pinned mjc_PlaneConvex)
+// -----------------------------------------------------------------------------
+
+struct ContactSolverParams {
+    float timeconst;
+    float dampratio;
+    float dmin;
+    float dmax;
+    float width;
+    float midpoint;
+    float power;
+    float impratio;
+    float margin;
+};
+
+kernel void kernel_cad_contact_manifold_v2(
+    device const float* geom_xpos_batch [[buffer(0)]],      // (B, 2, 3) foot geoms (0: left, 1: right)
+    device const float* geom_xmat_batch [[buffer(1)]],      // (B, 2, 9) row-major
+    device const float* left_mesh_verts [[buffer(2)]],      // (N_L, 3)
+    device const float* right_mesh_verts [[buffer(3)]],     // (N_R, 3)
+    device const int* left_mesh_graph [[buffer(4)]],        // int buffer
+    device const int* right_mesh_graph [[buffer(5)]],       // int buffer
+    constant float& left_rbound [[buffer(6)]],
+    constant float& right_rbound [[buffer(7)]],
+    device float* contact_pos_out [[buffer(8)]],            // (B, stride_nconmax, 3)
+    device float* contact_dist_out [[buffer(9)]],           // (B, stride_nconmax)
+    device float* contact_normal_out [[buffer(10)]],        // (B, stride_nconmax, 3)
+    device int* contact_body_out [[buffer(11)]],            // (B, stride_nconmax) body ID (7 or 16)
+    device int* contact_geom_out [[buffer(12)]],            // (B, stride_nconmax) geom ID (1 or 2)
+    device int* ncon_out [[buffer(13)]],                    // (B,)
+    device int* overflow_flag_out [[buffer(14)]],           // (B,)
+    constant int& stride_nconmax [[buffer(15)]],            // buffer allocation stride
+    constant int& active_nconmax [[buffer(16)]],            // active capacity limit
+    uint tid [[thread_position_in_grid]]
+) {
+    uint b_idx = tid;
+    device const float* g_xpos = geom_xpos_batch + b_idx * 2 * 3;
+    device const float* g_xmat = geom_xmat_batch + b_idx * 2 * 9;
+
+    device float* out_pos = contact_pos_out + b_idx * stride_nconmax * 3;
+    device float* out_dist = contact_dist_out + b_idx * stride_nconmax;
+    device float* out_norm = contact_normal_out + b_idx * stride_nconmax * 3;
+    device int* out_body = contact_body_out + b_idx * stride_nconmax;
+    device int* out_geom = contact_geom_out + b_idx * stride_nconmax;
+
+    // Non-finite input guard
+    bool finite_geom = true;
+    for (int i = 0; i < 2 * 3; ++i) {
+        if (!isfinite(g_xpos[i])) { finite_geom = false; break; }
+    }
+    for (int i = 0; i < 2 * 9; ++i) {
+        if (!isfinite(g_xmat[i])) { finite_geom = false; break; }
+    }
+    if (!finite_geom) {
+        ncon_out[b_idx] = 0;
+        overflow_flag_out[b_idx] = -1; // Non-finite input error
+        for (int c = 0; c < stride_nconmax; ++c) {
+            out_pos[c * 3 + 0] = NAN;
+            out_pos[c * 3 + 1] = NAN;
+            out_pos[c * 3 + 2] = NAN;
+            out_dist[c] = NAN;
+            out_norm[c * 3 + 0] = NAN;
+            out_norm[c * 3 + 1] = NAN;
+            out_norm[c * 3 + 2] = NAN;
+            out_body[c] = -1;
+            out_geom[c] = -1;
+        }
+        return;
+    }
+
+    int total_contacts = 0;
+    int overflow = 0;
+    int max_contacts = min(stride_nconmax, active_nconmax);
+
+    float3 pos1 = float3(0.0f, 0.0f, 0.0f);
+    float3 normal = float3(0.0f, 0.0f, 1.0f);
+    float3 ccd_dir = float3(0.0f, 0.0f, -1.0f);
+    float margin = 0.0f;
+
+    // Process left foot (foot 0, body 7, geom 1) then right foot (foot 1, body 16, geom 2)
+    for (int foot = 0; foot < 2; ++foot) {
+        float3 pos2 = float3(g_xpos[foot * 3 + 0], g_xpos[foot * 3 + 1], g_xpos[foot * 3 + 2]);
+        float3x3 mat2 = load_row_major_mat3(g_xmat + foot * 9);
+
+        device const float* verts = (foot == 0) ? left_mesh_verts : right_mesh_verts;
+        device const int* graph = (foot == 0) ? left_mesh_graph : right_mesh_graph;
+        float rbound = (foot == 0) ? left_rbound : right_rbound;
+        int body_id = (foot == 0) ? 7 : 16;
+        int geom_id = (foot == 0) ? 1 : 2;
+
+        // Direction in geom local frame: transpose(mat2) * ccd_dir
+        float3 locdir = transpose(mat2) * ccd_dir;
+
+        int numvert = graph[0];
+        device const int* vert_edgeadr = graph + 2;
+        device const int* vert_globalid = graph + 2 + numvert;
+        device const int* edge_localid = graph + 2 + 2 * numvert;
+
+        // Hill climb on convex hull graph to find support vertex
+        int ibest = 0;
+        int v0_gid = vert_globalid[0];
+        float3 v0 = float3(verts[3 * v0_gid + 0], verts[3 * v0_gid + 1], verts[3 * v0_gid + 2]);
+        float tmp = dot(v0, locdir);
+
+        bool change = true;
+        int climb_iters = 0;
+        while (change && climb_iters < 300) {
+            climb_iters++;
+            change = false;
+            int i = vert_edgeadr[ibest];
+            while (edge_localid[i] >= 0) {
+                int locid = edge_localid[i];
+                int v_gid = vert_globalid[locid];
+                float3 v = float3(verts[3 * v_gid + 0], verts[3 * v_gid + 1], verts[3 * v_gid + 2]);
+                float vdot = dot(v, locdir);
+                if (vdot > tmp) {
+                    tmp = vdot;
+                    ibest = locid;
+                    change = true;
+                }
+                i++;
+            }
+        }
+
+        // Primary support contact
+        int ibest_global = vert_globalid[ibest];
+        float3 best_v = float3(verts[3 * ibest_global + 0], verts[3 * ibest_global + 1], verts[3 * ibest_global + 2]);
+        float3 best_world = pos2 + mat2 * best_v;
+        float3 dif0 = best_world - pos1;
+        float dist0 = dot(normal, dif0);
+
+        if (dist0 <= margin) {
+            float3 pos0 = best_world - 0.5f * dist0 * normal;
+
+            float3 foot_pts[3];
+            float foot_dists[3];
+            foot_pts[0] = pos0;
+            foot_dists[0] = dist0;
+            int foot_count = 1;
+
+            // Look for additional contacts in ibest neighborhood
+            float threshold = dot(normal, pos2 - pos1) - margin;
+            float tol_dist = 0.3f * rbound;
+
+            int i = vert_edgeadr[ibest];
+            while (edge_localid[i] >= 0 && foot_count < 3) {
+                int locid = edge_localid[i];
+                int v_gid = vert_globalid[locid];
+                float3 v = float3(verts[3 * v_gid + 0], verts[3 * v_gid + 1], verts[3 * v_gid + 2]);
+                float vdot = dot(v, locdir);
+                if (vdot > threshold) {
+                    float3 pnt = pos2 + mat2 * v;
+                    if (distance(pnt, pos0) >= tol_dist) {
+                        float3 dif = pnt - pos1;
+                        float c_dist = dot(normal, dif);
+                        float3 c_pos = pnt - 0.5f * c_dist * normal;
+                        foot_pts[foot_count] = c_pos;
+                        foot_dists[foot_count] = c_dist;
+                        foot_count++;
+                    }
+                }
+                i++;
+            }
+
+            // Store into batch buffer
+            for (int c = 0; c < foot_count; ++c) {
+                if (total_contacts < max_contacts) {
+                    out_pos[total_contacts * 3 + 0] = foot_pts[c].x;
+                    out_pos[total_contacts * 3 + 1] = foot_pts[c].y;
+                    out_pos[total_contacts * 3 + 2] = foot_pts[c].z;
+
+                    out_dist[total_contacts] = foot_dists[c];
+
+                    out_norm[total_contacts * 3 + 0] = 0.0f;
+                    out_norm[total_contacts * 3 + 1] = 0.0f;
+                    out_norm[total_contacts * 3 + 2] = 1.0f;
+
+                    out_body[total_contacts] = body_id;
+                    out_geom[total_contacts] = geom_id;
+                    total_contacts++;
+                } else {
+                    overflow = 1;
+                }
+            }
+        }
+    }
+
+    // Zero out unused slots up to stride_nconmax
+    for (int c = total_contacts; c < stride_nconmax; ++c) {
+        out_pos[c * 3 + 0] = 0.0f;
+        out_pos[c * 3 + 1] = 0.0f;
+        out_pos[c * 3 + 2] = 0.0f;
+        out_dist[c] = 0.0f;
+        out_norm[c * 3 + 0] = 0.0f;
+        out_norm[c * 3 + 1] = 0.0f;
+        out_norm[c * 3 + 2] = 0.0f;
+        out_body[c] = 0;
+        out_geom[c] = 0;
+    }
+
+    ncon_out[b_idx] = total_contacts;
+    overflow_flag_out[b_idx] = overflow;
+}
+
+// -----------------------------------------------------------------------------
+// 2c. Contact Constraint Assembly Kernel (Exact MuJoCo 3.10.0 formulas)
+// -----------------------------------------------------------------------------
+
+kernel void kernel_assemble_contact_constraints(
+    device const float* contact_pos_batch [[buffer(0)]],        // (B, stride_nconmax, 3)
+    device const float* contact_dist_batch [[buffer(1)]],       // (B, stride_nconmax)
+    device const int* contact_body_batch [[buffer(2)]],         // (B, stride_nconmax)
+    device const int* ncon_batch [[buffer(3)]],                 // (B,)
+    device const float* body_xpos_batch [[buffer(4)]],          // (B, 17, 3)
+    device const float* body_xmat_batch [[buffer(5)]],          // (B, 17, 9)
+    device const float* qvel_batch [[buffer(6)]],              // (B, 20)
+    constant BodyConstants* bodies [[buffer(7)]],               // 17 bodies
+    device const float* body_invweight0 [[buffer(8)]],          // (17, 2)
+    device const float* friction_batch [[buffer(9)]],           // (B, stride_nconmax, 2)
+    device float* J_out [[buffer(10)]],                         // (B, stride_capacity, 20)
+    device float* aref_out [[buffer(11)]],                      // (B, stride_capacity)
+    device float* R_out [[buffer(12)]],                         // (B, stride_capacity)
+    device int* efc_type_out [[buffer(13)]],                    // (B, stride_capacity)
+    device int* nefc_out [[buffer(14)]],                        // (B,)
+    device int* overflow_flag_out [[buffer(15)]],               // (B,)
+    constant int& stride_nconmax [[buffer(16)]],                // contact input stride (e.g. 35)
+    constant int& stride_capacity [[buffer(17)]],               // output allocation stride (e.g. 32)
+    constant ContactSolverParams& params [[buffer(18)]],        // solver parameters
+    constant int& active_capacity [[buffer(19)]],               // active capacity limit
+    uint tid [[thread_position_in_grid]]
+) {
+    uint b_idx = tid;
+
+    // Kinematic state non-finite guard
+    device const float* b_xpos = body_xpos_batch + b_idx * 17 * 3;
+    device const float* b_xmat = body_xmat_batch + b_idx * 17 * 9;
+    device const float* qvel = qvel_batch + b_idx * 20;
+
+    bool finite_state = true;
+    for (int i = 0; i < 17 * 3; ++i) { if (!isfinite(b_xpos[i])) { finite_state = false; break; } }
+    for (int i = 0; i < 17 * 9; ++i) { if (!isfinite(b_xmat[i])) { finite_state = false; break; } }
+    for (int i = 0; i < 20; ++i) { if (!isfinite(qvel[i])) { finite_state = false; break; } }
+    if (!finite_state) {
+        nefc_out[b_idx] = 0;
+        overflow_flag_out[b_idx] = -1; // Non-finite state error
+        for (int r = 0; r < stride_capacity; ++r) {
+            aref_out[b_idx * stride_capacity + r] = NAN;
+            R_out[b_idx * stride_capacity + r] = NAN;
+            efc_type_out[b_idx * stride_capacity + r] = -1;
+            for (int col = 0; col < 20; ++col) {
+                J_out[b_idx * stride_capacity * 20 + r * 20 + col] = NAN;
+            }
+        }
+        return;
+    }
+
+    int ncon = ncon_batch[b_idx];
+    if (ncon < 0 || ncon > stride_nconmax) {
+        nefc_out[b_idx] = 0;
+        overflow_flag_out[b_idx] = -4; // Invalid contact count error
+        for (int r = 0; r < stride_capacity; ++r) {
+            aref_out[b_idx * stride_capacity + r] = NAN;
+            R_out[b_idx * stride_capacity + r] = NAN;
+            efc_type_out[b_idx * stride_capacity + r] = -1;
+            for (int col = 0; col < 20; ++col) {
+                J_out[b_idx * stride_capacity * 20 + r * 20 + col] = NAN;
+            }
+        }
+        return;
+    }
+
+    if (ncon == 0) {
+        nefc_out[b_idx] = 0;
+        overflow_flag_out[b_idx] = 0;
+        for (int r = 0; r < stride_capacity; ++r) {
+            aref_out[b_idx * stride_capacity + r] = 0.0f;
+            R_out[b_idx * stride_capacity + r] = 1.0f;
+            efc_type_out[b_idx * stride_capacity + r] = 6;
+            for (int col = 0; col < 20; ++col) {
+                J_out[b_idx * stride_capacity * 20 + r * 20 + col] = 0.0f;
+            }
+        }
+        return;
+    }
+
+    // Complete 4-row contact groups capacity limit
+    int max_rows = 4 * (min(stride_capacity, active_capacity) / 4);
+    int nefc = ncon * 4;
+    int overflow = 0;
+    if (nefc > max_rows) {
+        overflow = 1;
+        nefc = max_rows;
+    }
+    nefc_out[b_idx] = nefc;
+    overflow_flag_out[b_idx] = overflow;
+
+    device const float* c_pos = contact_pos_batch + b_idx * stride_nconmax * 3;
+    device const float* c_dist = contact_dist_batch + b_idx * stride_nconmax;
+    device const int* c_body = contact_body_batch + b_idx * stride_nconmax;
+    device const float* f_batch = friction_batch + b_idx * stride_nconmax * 2;
+
+    float3 base_pos = float3(b_xpos[2 * 3 + 0], b_xpos[2 * 3 + 1], b_xpos[2 * 3 + 2]);
+    float3x3 base_mat = load_row_major_mat3(b_xmat + 2 * 9);
+
+    // MuJoCo spring-damper reference constants
+    float K = 1.0f / (params.dmax * params.dmax * params.timeconst * params.timeconst * params.dampratio * params.dampratio);
+    float B = 2.0f / (params.dmax * params.timeconst);
+
+    int rows_assembled = 0;
+    int max_contacts = min(ncon, max_rows / 4);
+
+    for (int c = 0; c < max_contacts; ++c) {
+        float3 p = float3(c_pos[c * 3 + 0], c_pos[c * 3 + 1], c_pos[c * 3 + 2]);
+        float dist = c_dist[c];
+        int body_id = c_body[c];
+
+        // Validate body ID and finiteness
+        if ((body_id != 7 && body_id != 16) || !isfinite(p.x) || !isfinite(p.y) || !isfinite(p.z) || !isfinite(dist)) {
+            nefc_out[b_idx] = 0;
+            overflow_flag_out[b_idx] = (body_id != 7 && body_id != 16) ? -2 : -1;
+            for (int r = 0; r < stride_capacity; ++r) {
+                aref_out[b_idx * stride_capacity + r] = NAN;
+                R_out[b_idx * stride_capacity + r] = NAN;
+                efc_type_out[b_idx * stride_capacity + r] = -1;
+                for (int col = 0; col < 20; ++col) {
+                    J_out[b_idx * stride_capacity * 20 + r * 20 + col] = NAN;
+                }
+            }
+            return;
+        }
+
+        // 1. Diagonal approximation from body inverse weights
+        float tran = body_invweight0[body_id * 2 + 0]; // ground is body 0 with 0 invw
+        float mu1 = f_batch[c * 2 + 0];
+        float mu2 = f_batch[c * 2 + 1];
+        if (mu1 <= 0.0f || mu2 <= 0.0f || !isfinite(mu1) || !isfinite(mu2)) {
+            nefc_out[b_idx] = 0;
+            overflow_flag_out[b_idx] = -3; // Invalid or non-finite friction error
+            for (int r = 0; r < stride_capacity; ++r) {
+                aref_out[b_idx * stride_capacity + r] = NAN;
+                R_out[b_idx * stride_capacity + r] = NAN;
+                efc_type_out[b_idx * stride_capacity + r] = -1;
+                for (int col = 0; col < 20; ++col) {
+                    J_out[b_idx * stride_capacity * 20 + r * 20 + col] = NAN;
+                }
+            }
+            return;
+        }
+        float mu0 = mu1;
+        float dA0 = tran + (mu0 * mu0) * tran;
+
+        // 2. Impedance spline
+        float x = abs(dist - params.margin) / params.width;
+        float imp = params.dmin;
+        if (x <= 0.0f) {
+            imp = params.dmin;
+        } else if (x >= 1.0f) {
+            imp = params.dmax;
+        } else if (x < params.midpoint) {
+            float a_imp = 1.0f / pow(params.midpoint, params.power - 1.0f);
+            imp = params.dmin + a_imp * pow(x, params.power) * (params.dmax - params.dmin);
+        } else {
+            float b_imp = 1.0f / pow(1.0f - params.midpoint, params.power - 1.0f);
+            imp = params.dmin + (1.0f - b_imp * pow(1.0f - x, params.power)) * (params.dmax - params.dmin);
+        }
+
+        // 3. Regularization R
+        float R0 = (1.0f - imp) * dA0 / imp;
+        float R1 = R0 / max(1e-14f, params.impratio);
+        float mu_reg = mu0 * sqrt(R1 / R0);
+        float Rpy = 2.0f * (mu_reg * mu_reg) * R0;
+
+        // 4. Point Jacobian (3 x 20)
+        float J_p[3][20];
+        for (int r = 0; r < 3; ++r) {
+            for (int col = 0; col < 20; ++col) {
+                J_p[r][col] = 0.0f;
+            }
+        }
+        // Freejoint linear DOFs (0, 1, 2)
+        J_p[0][0] = 1.0f;
+        J_p[1][1] = 1.0f;
+        J_p[2][2] = 1.0f;
+
+        // Freejoint angular DOFs (3, 4, 5): col_j = base_mat[:, j] x r
+        float3 r = p - base_pos;
+        float3 col3 = cross(base_mat[0], r);
+        float3 col4 = cross(base_mat[1], r);
+        float3 col5 = cross(base_mat[2], r);
+
+        J_p[0][3] = col3.x;  J_p[0][4] = col4.x;  J_p[0][5] = col5.x;
+        J_p[1][3] = col3.y;  J_p[1][4] = col4.y;  J_p[1][5] = col5.y;
+        J_p[2][3] = col3.z;  J_p[2][4] = col4.z;  J_p[2][5] = col5.z;
+
+        // Ancestor hinge joints
+        int curr_b = body_id;
+        while (curr_b > 2) {
+            int dof_adr = bodies[curr_b].dof_adr;
+            float3 local_axis = float3(bodies[curr_b].jnt_axis[0], bodies[curr_b].jnt_axis[1], bodies[curr_b].jnt_axis[2]);
+            float3x3 mat_b = load_row_major_mat3(b_xmat + curr_b * 9);
+            float3 world_axis = mat_b * local_axis;
+            float3 anchor = float3(b_xpos[curr_b * 3 + 0], b_xpos[curr_b * 3 + 1], b_xpos[curr_b * 3 + 2]);
+            float3 r_j = p - anchor;
+            float3 col = cross(world_axis, r_j);
+
+            J_p[0][dof_adr] = col.x;
+            J_p[1][dof_adr] = col.y;
+            J_p[2][dof_adr] = col.z;
+
+            curr_b = bodies[curr_b].parent_id;
+        }
+
+        // 5. Four pyramidal facet directions:
+        // d0 = (0, mu1, 1), d1 = (0, -mu1, 1), d2 = (-mu2, 0, 1), d3 = (mu2, 0, 1)
+        float3 dirs[4] = {
+            float3(0.0f, mu1, 1.0f),
+            float3(0.0f, -mu1, 1.0f),
+            float3(-mu2, 0.0f, 1.0f),
+            float3(mu2, 0.0f, 1.0f)
+        };
+
+        for (int k = 0; k < 4; ++k) {
+            int row = c * 4 + k;
+            float3 d_k = dirs[k];
+
+            float v_rel = 0.0f;
+            for (int dof = 0; dof < 20; ++dof) {
+                float j_val = d_k.x * J_p[0][dof] + d_k.y * J_p[1][dof] + d_k.z * J_p[2][dof];
+                J_out[b_idx * stride_capacity * 20 + row * 20 + dof] = j_val;
+                v_rel += j_val * qvel[dof];
+            }
+
+            float aref_val = -B * v_rel - K * imp * (dist - params.margin);
+            aref_out[b_idx * stride_capacity + row] = aref_val;
+            R_out[b_idx * stride_capacity + row] = Rpy;
+            efc_type_out[b_idx * stride_capacity + row] = 6; // mjCNSTR_CONTACT_PYRAMIDAL
+            rows_assembled++;
+        }
+    }
+
+    // Zero out unused rows up to stride_capacity
+    for (int r = rows_assembled; r < stride_capacity; ++r) {
+        aref_out[b_idx * stride_capacity + r] = 0.0f;
+        R_out[b_idx * stride_capacity + r] = 1.0f;
+        efc_type_out[b_idx * stride_capacity + r] = 6;
+        for (int col = 0; col < 20; ++col) {
+            J_out[b_idx * stride_capacity * 20 + r * 20 + col] = 0.0f;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
 // 3. Constrained Solve Kernel
 // -----------------------------------------------------------------------------
 
@@ -668,16 +1120,49 @@ kernel void kernel_constrained_solve(
     device const float* qvel_batch [[buffer(11)]],          // (B, 20)
     device float* qacc_out [[buffer(12)]],                  // (B, 20)
     device float* qfrc_constraint_out [[buffer(13)]],       // (B, 20)
+    device const int* solver_status_batch [[buffer(14)]],   // (B,) optional / solver status from Cholesky
     uint tid [[thread_position_in_grid]]
 ) {
     uint b_idx = tid;
+    device float* qacc = qacc_out + b_idx * 20;
+    device float* qfrc_c = qfrc_constraint_out + b_idx * 20;
+
+    // Propagate upstream factorization / solve failure into downstream outputs
+    if (solver_status_batch != nullptr && solver_status_batch[b_idx] != 0) {
+        for (int i = 0; i < 20; ++i) {
+            qacc[i] = NAN;
+            qfrc_c[i] = NAN;
+        }
+        return;
+    }
+
+    device const float* M_inv = M_inv_batch + b_idx * 400;
+
+    // Guard against non-finite entries in M_inv
+    for (int i = 0; i < 400; ++i) {
+        if (!isfinite(M_inv[i])) {
+            for (int k = 0; k < 20; ++k) {
+                qacc[k] = NAN;
+                qfrc_c[k] = NAN;
+            }
+            return;
+        }
+    }
+
+    // Guard against non-finite entries in bias
+    device const float* bias = qfrc_bias_batch + b_idx * 20;
+    for (int i = 0; i < 20; ++i) {
+        if (!isfinite(bias[i])) {
+            for (int k = 0; k < 20; ++k) {
+                qacc[k] = NAN;
+                qfrc_c[k] = NAN;
+            }
+            return;
+        }
+    }
+
     int ncon = ncon_batch[b_idx];
     if (ncon <= 0) {
-        device const float* M_inv = M_inv_batch + b_idx * 400;
-        device const float* bias = qfrc_bias_batch + b_idx * 20;
-        device float* qacc = qacc_out + b_idx * 20;
-        device float* qfrc_c = qfrc_constraint_out + b_idx * 20;
-
         for (int i = 0; i < 20; ++i) {
             qfrc_c[i] = 0.0f;
             float sum = 0.0f;
@@ -692,16 +1177,12 @@ kernel void kernel_constrained_solve(
     int nefc = ncon * 4;
     if (nefc > 32) nefc = 32;
 
-    device const float* M_inv = M_inv_batch + b_idx * 400;
-    device const float* bias = qfrc_bias_batch + b_idx * 20;
     device const float* c_pos = contact_pos_batch + b_idx * nconmax * 3;
     device const float* c_dist = contact_dist_batch + b_idx * nconmax;
     device const int* c_body = contact_body_batch + b_idx * nconmax;
     device const float* b_xpos = body_xpos_batch + b_idx * 17 * 3;
     device const float* b_xmat = body_xmat_batch + b_idx * 17 * 9;
     device const float* qvel = qvel_batch + b_idx * 20;
-    device float* qacc = qacc_out + b_idx * 20;
-    device float* qfrc_c = qfrc_constraint_out + b_idx * 20;
 
     // 1. Assemble contact Jacobian J (nefc x 20)
     float J[32][20];
@@ -879,7 +1360,7 @@ kernel void kernel_cholesky_solve(
     constant int& K [[buffer(2)]],                  // number of RHS columns
     device float* L_out [[buffer(3)]],              // (B, 20, 20)
     device float* X_out [[buffer(4)]],              // (B, 20, K)
-    device int* status_out [[buffer(5)]],           // (B,) 0: success, -1: pivot/NaN failure
+    device int* status_out [[buffer(5)]],           // (B,) 0: success, -1: non-positive pivot/NaN, -2: non-finite RHS, -3: solve failure
     uint tid [[thread_position_in_grid]]
 ) {
     uint b_idx = tid;
@@ -887,6 +1368,26 @@ kernel void kernel_cholesky_solve(
     device const float* B = B_batch + b_idx * 20 * K;
     device float* L = L_out + b_idx * 400;
     device float* X = X_out + b_idx * 20 * K;
+
+    // Check input M for non-finite entries
+    for (int i = 0; i < 400; ++i) {
+        if (!isfinite(M[i])) {
+            status_out[b_idx] = -1;
+            for (int k = 0; k < 400; ++k) L[k] = NAN;
+            for (int k = 0; k < 20 * K; ++k) X[k] = NAN;
+            return;
+        }
+    }
+
+    // Check input B for non-finite entries
+    for (int i = 0; i < 20 * K; ++i) {
+        if (!isfinite(B[i])) {
+            status_out[b_idx] = -2;
+            for (int k = 0; k < 400; ++k) L[k] = NAN;
+            for (int k = 0; k < 20 * K; ++k) X[k] = NAN;
+            return;
+        }
+    }
 
     float L_loc[20][20];
     for (int i = 0; i < 20; ++i) {
@@ -904,8 +1405,10 @@ kernel void kernel_cholesky_solve(
             sum_sq += L_loc[j][k] * L_loc[j][k];
         }
         float s = M[j * 20 + j] - sum_sq;
-        if (s <= 0.0f || isnan(s)) {
-            status_out[b_idx] = -1; // non-positive pivot or NaN detected
+        if (s <= 0.0f || !isfinite(s)) {
+            status_out[b_idx] = -1; // non-positive pivot or non-finite detected
+            for (int k = 0; k < 400; ++k) L[k] = NAN;
+            for (int k = 0; k < 20 * K; ++k) X[k] = NAN;
             return;
         }
         float diag = sqrt(s);
@@ -946,7 +1449,495 @@ kernel void kernel_cholesky_solve(
             for (int k = i + 1; k < 20; ++k) {
                 s -= L_loc[k][i] * X[k * K + c];
             }
-            X[i * K + c] = s / L_loc[i][i];
+            float x_val = s / L_loc[i][i];
+            if (!isfinite(x_val)) {
+                status_out[b_idx] = -3;
+                for (int k = 0; k < 20 * K; ++k) X[k] = NAN;
+                return;
+            }
+            X[i * K + c] = x_val;
         }
     }
 }
+
+// -----------------------------------------------------------------------------
+// 5. Oracle-Supplied Pyramidal Contact Constrained Solve Kernel
+// -----------------------------------------------------------------------------
+
+constant int MAX_ORACLE_CONSTRAINTS = 32;
+
+kernel void kernel_oracle_constrained_solve(
+    device const float* L_batch [[buffer(0)]],                // (B, 20, 20) Cholesky factor M = L L^T
+    device const float* f_smooth_batch [[buffer(1)]],         // (B, 20) Complete smooth generalized forces
+    device const float* J_batch [[buffer(2)]],                // (B, capacity, 20) Constraint Jacobian
+    device const float* aref_batch [[buffer(3)]],             // (B, capacity) Reference acceleration
+    device const float* R_batch [[buffer(4)]],                // (B, capacity) Constraint regularization (efc_R)
+    device const int* efc_type_batch [[buffer(5)]],           // (B, capacity) Constraint row types (type 6 only)
+    device const int* nefc_batch [[buffer(6)]],               // (B,) Number of active constraint rows
+    device const int* upstream_status_batch [[buffer(7)]],    // (B,) Upstream status (e.g. from Cholesky)
+    device float* lambda_out [[buffer(8)]],                   // (B, capacity) Constraint forces
+    device float* qfrc_constraint_out [[buffer(9)]],          // (B, 20) Generalized constraint forces J^T lambda
+    device float* qacc_out [[buffer(10)]],                    // (B, 20) Final acceleration
+    device int* solver_status_out [[buffer(11)]],             // (B,) Solver status (0: success, 1: unconverged, negative: error)
+    device int* actual_iters_out [[buffer(12)]],              // (B,) Actual PGS iterations executed
+    device float* dual_residual_out [[buffer(13)]],           // (B,) Max complementarity residual
+    constant int& max_iters [[buffer(14)]],                   // Maximum PGS iterations
+    constant int& capacity [[buffer(15)]],                    // Buffer capacity (max supported is 32)
+    constant float& tol [[buffer(16)]],                       // Convergence tolerance
+    uint tid [[thread_position_in_grid]]
+) {
+    uint b_idx = tid;
+    device float* qacc = qacc_out + b_idx * 20;
+    device float* qfrc_c = qfrc_constraint_out + b_idx * 20;
+    device float* lam_out = lambda_out + b_idx * capacity;
+
+    // 1. Upstream status propagation
+    if (upstream_status_batch != nullptr && upstream_status_batch[b_idx] != 0) {
+        solver_status_out[b_idx] = upstream_status_batch[b_idx];
+        actual_iters_out[b_idx] = 0;
+        dual_residual_out[b_idx] = NAN;
+        for (int k = 0; k < 20; ++k) {
+            qacc[k] = NAN;
+            qfrc_c[k] = NAN;
+        }
+        for (int k = 0; k < capacity; ++k) {
+            lam_out[k] = NAN;
+        }
+        return;
+    }
+
+    // 2. Capacity and nefc bounds guard
+    int nefc = nefc_batch[b_idx];
+    if (nefc < 0 || nefc > capacity || nefc > MAX_ORACLE_CONSTRAINTS) {
+        solver_status_out[b_idx] = -4; // Capacity overflow or invalid nefc
+        actual_iters_out[b_idx] = 0;
+        dual_residual_out[b_idx] = NAN;
+        for (int k = 0; k < 20; ++k) {
+            qacc[k] = NAN;
+            qfrc_c[k] = NAN;
+        }
+        for (int k = 0; k < capacity; ++k) {
+            lam_out[k] = NAN;
+        }
+        return;
+    }
+
+    // 3. Supported constraint types guard (accept exclusively type 6: mjCNSTR_CONTACT_PYRAMIDAL)
+    device const int* efc_type = efc_type_batch + b_idx * capacity;
+    for (int i = 0; i < nefc; ++i) {
+        if (efc_type[i] != 6) {
+            solver_status_out[b_idx] = -5; // Unsupported constraint row type
+            actual_iters_out[b_idx] = 0;
+            dual_residual_out[b_idx] = NAN;
+            for (int k = 0; k < 20; ++k) {
+                qacc[k] = NAN;
+                qfrc_c[k] = NAN;
+            }
+            for (int k = 0; k < capacity; ++k) {
+                lam_out[k] = NAN;
+            }
+            return;
+        }
+    }
+
+    // 4. Non-finite input guards
+    device const float* L = L_batch + b_idx * 400;
+    device const float* f_smooth = f_smooth_batch + b_idx * 20;
+    device const float* J = J_batch + b_idx * capacity * 20;
+    device const float* aref = aref_batch + b_idx * capacity;
+    device const float* R = R_batch + b_idx * capacity;
+
+    for (int i = 0; i < 400; ++i) {
+        if (!isfinite(L[i])) {
+            solver_status_out[b_idx] = -1;
+            actual_iters_out[b_idx] = 0;
+            dual_residual_out[b_idx] = NAN;
+            for (int k = 0; k < 20; ++k) { qacc[k] = NAN; qfrc_c[k] = NAN; }
+            for (int k = 0; k < capacity; ++k) lam_out[k] = NAN;
+            return;
+        }
+    }
+    for (int i = 0; i < 20; ++i) {
+        if (!isfinite(f_smooth[i]) || L[i * 20 + i] <= 0.0f) {
+            solver_status_out[b_idx] = -1;
+            actual_iters_out[b_idx] = 0;
+            dual_residual_out[b_idx] = NAN;
+            for (int k = 0; k < 20; ++k) { qacc[k] = NAN; qfrc_c[k] = NAN; }
+            for (int k = 0; k < capacity; ++k) lam_out[k] = NAN;
+            return;
+        }
+    }
+    for (int i = 0; i < nefc; ++i) {
+        if (!isfinite(aref[i]) || !isfinite(R[i]) || R[i] <= 0.0f) {
+            solver_status_out[b_idx] = -1;
+            actual_iters_out[b_idx] = 0;
+            dual_residual_out[b_idx] = NAN;
+            for (int k = 0; k < 20; ++k) { qacc[k] = NAN; qfrc_c[k] = NAN; }
+            for (int k = 0; k < capacity; ++k) lam_out[k] = NAN;
+            return;
+        }
+        for (int k = 0; k < 20; ++k) {
+            if (!isfinite(J[i * 20 + k])) {
+                solver_status_out[b_idx] = -1;
+                actual_iters_out[b_idx] = 0;
+                dual_residual_out[b_idx] = NAN;
+                for (int p = 0; p < 20; ++p) { qacc[p] = NAN; qfrc_c[p] = NAN; }
+                for (int p = 0; p < capacity; ++p) lam_out[p] = NAN;
+                return;
+            }
+        }
+    }
+
+    // 5. Unconstrained acceleration solve: L L^T a_0 = f_smooth
+    float y_0[20];
+    for (int i = 0; i < 20; ++i) {
+        float s = f_smooth[i];
+        for (int p = 0; p < i; ++p) {
+            s -= L[i * 20 + p] * y_0[p];
+        }
+        float y_val = s / L[i * 20 + i];
+        if (!isfinite(y_val)) {
+            solver_status_out[b_idx] = -3; // Solve overflow / non-finite acceleration
+            actual_iters_out[b_idx] = 0;
+            dual_residual_out[b_idx] = NAN;
+            for (int k = 0; k < 20; ++k) { qacc[k] = NAN; qfrc_c[k] = NAN; }
+            for (int k = 0; k < capacity; ++k) lam_out[k] = NAN;
+            return;
+        }
+        y_0[i] = y_val;
+    }
+
+    float a_0[20];
+    for (int i = 19; i >= 0; --i) {
+        float s = y_0[i];
+        for (int p = i + 1; p < 20; ++p) {
+            s -= L[p * 20 + i] * a_0[p];
+        }
+        float a_val = s / L[i * 20 + i];
+        if (!isfinite(a_val)) {
+            solver_status_out[b_idx] = -3; // Solve overflow / non-finite acceleration
+            actual_iters_out[b_idx] = 0;
+            dual_residual_out[b_idx] = NAN;
+            for (int k = 0; k < 20; ++k) { qacc[k] = NAN; qfrc_c[k] = NAN; }
+            for (int k = 0; k < capacity; ++k) lam_out[k] = NAN;
+            return;
+        }
+        a_0[i] = a_val;
+    }
+
+    // 6. Zero-contact shortcut (airborne / no contacts)
+    if (nefc == 0) {
+        for (int i = 0; i < 20; ++i) {
+            qacc[i] = a_0[i];
+            qfrc_c[i] = 0.0f;
+        }
+        for (int i = 0; i < capacity; ++i) {
+            lam_out[i] = 0.0f;
+        }
+        solver_status_out[b_idx] = 0;
+        actual_iters_out[b_idx] = 0;
+        dual_residual_out[b_idx] = 0.0f;
+        return;
+    }
+
+    // 7. Assemble Delassus matrix: L Y = J^T => Y = L^{-1} J^T, A = Y^T Y + diag(R)
+    float Y[MAX_ORACLE_CONSTRAINTS][20];
+    for (int i = 0; i < nefc; ++i) {
+        for (int k = 0; k < 20; ++k) {
+            float s = J[i * 20 + k];
+            for (int p = 0; p < k; ++p) {
+                s -= L[k * 20 + p] * Y[i][p];
+            }
+            float y_val = s / L[k * 20 + k];
+            if (!isfinite(y_val)) {
+                solver_status_out[b_idx] = -3;
+                actual_iters_out[b_idx] = 0;
+                dual_residual_out[b_idx] = NAN;
+                for (int p_idx = 0; p_idx < 20; ++p_idx) { qacc[p_idx] = NAN; qfrc_c[p_idx] = NAN; }
+                for (int p_idx = 0; p_idx < capacity; ++p_idx) lam_out[p_idx] = NAN;
+                return;
+            }
+            Y[i][k] = y_val;
+        }
+    }
+
+    float A[MAX_ORACLE_CONSTRAINTS][MAX_ORACLE_CONSTRAINTS];
+    for (int i = 0; i < nefc; ++i) {
+        for (int j = 0; j < nefc; ++j) {
+            float s = 0.0f;
+            for (int k = 0; k < 20; ++k) {
+                s += Y[i][k] * Y[j][k];
+            }
+            if (i == j) {
+                s += R[i];
+            }
+            A[i][j] = s;
+        }
+        if (A[i][i] <= 1e-12f || !isfinite(A[i][i])) {
+            solver_status_out[b_idx] = -2; // Non-positive / singular Delassus diagonal
+            actual_iters_out[b_idx] = 0;
+            dual_residual_out[b_idx] = NAN;
+            for (int k = 0; k < 20; ++k) { qacc[k] = NAN; qfrc_c[k] = NAN; }
+            for (int k = 0; k < capacity; ++k) lam_out[k] = NAN;
+            return;
+        }
+    }
+
+    // 8. Assemble free constraint acceleration b = J a_0 - aref
+    float b_vec[MAX_ORACLE_CONSTRAINTS];
+    float lam[MAX_ORACLE_CONSTRAINTS];
+    float g[MAX_ORACLE_CONSTRAINTS];
+    for (int i = 0; i < nefc; ++i) {
+        float s = 0.0f;
+        for (int k = 0; k < 20; ++k) {
+            s += J[i * 20 + k] * a_0[k];
+        }
+        float b_val = s - aref[i];
+        if (!isfinite(b_val)) {
+            solver_status_out[b_idx] = -3;
+            actual_iters_out[b_idx] = 0;
+            dual_residual_out[b_idx] = NAN;
+            for (int k = 0; k < 20; ++k) { qacc[k] = NAN; qfrc_c[k] = NAN; }
+            for (int k = 0; k < capacity; ++k) lam_out[k] = NAN;
+            return;
+        }
+        b_vec[i] = b_val;
+        lam[i] = 0.0f; // Deterministic zero-start
+        g[i] = b_val;
+    }
+
+    // 9. Projected Gauss-Seidel (PGS) solve for lambda >= 0
+    int iters_taken = max_iters;
+    for (int iter = 0; iter < max_iters; ++iter) {
+        float max_delta = 0.0f;
+        for (int i = 0; i < nefc; ++i) {
+            float delta = -g[i] / A[i][i];
+            float lam_new = max(0.0f, lam[i] + delta);
+            float d_act = lam_new - lam[i];
+            if (abs(d_act) > 1e-12f) {
+                for (int j = 0; j < nefc; ++j) {
+                    g[j] += A[j][i] * d_act;
+                }
+                lam[i] = lam_new;
+                max_delta = max(max_delta, abs(d_act));
+            }
+        }
+        float cur_dual_infeas = 0.0f;
+        for (int i = 0; i < nefc; ++i) {
+            cur_dual_infeas = max(cur_dual_infeas, max(0.0f, -g[i]));
+        }
+        if (max_delta < tol && cur_dual_infeas <= 1e-4f) {
+            iters_taken = iter + 1;
+            break;
+        }
+        if (max_delta < 1e-12f) {
+            iters_taken = iter + 1;
+            break;
+        }
+    }
+
+    // 10. Diagonally scaled projected-gradient residual and dual infeasibility check
+    float max_proj_res = 0.0f;
+    float max_dual_infeas = 0.0f;
+    for (int i = 0; i < nefc; ++i) {
+        if (!isfinite(lam[i]) || !isfinite(g[i])) {
+            solver_status_out[b_idx] = -3;
+            actual_iters_out[b_idx] = 0;
+            dual_residual_out[b_idx] = NAN;
+            for (int k = 0; k < 20; ++k) { qacc[k] = NAN; qfrc_c[k] = NAN; }
+            for (int k = 0; k < capacity; ++k) lam_out[k] = NAN;
+            return;
+        }
+        max_dual_infeas = max(max_dual_infeas, max(0.0f, -g[i]));
+        float step = abs(lam[i] - max(0.0f, lam[i] - g[i] / A[i][i]));
+        max_proj_res = max(max_proj_res, step);
+    }
+
+    // 11. Generalized constraint forces: f_c = J^T * lambda
+    for (int k = 0; k < 20; ++k) {
+        float s = 0.0f;
+        for (int i = 0; i < nefc; ++i) {
+            s += J[i * 20 + k] * lam[i];
+        }
+        qfrc_c[k] = s;
+    }
+
+    // 12. Corrected acceleration: y_c = Y lambda, L^T delta_a = y_c, qacc = a_0 + delta_a
+    float y_c[20];
+    for (int k = 0; k < 20; ++k) {
+        float s = 0.0f;
+        for (int i = 0; i < nefc; ++i) {
+            s += Y[i][k] * lam[i];
+        }
+        y_c[k] = s;
+    }
+
+    float delta_a[20];
+    for (int i = 19; i >= 0; --i) {
+        float s = y_c[i];
+        for (int p = i + 1; p < 20; ++p) {
+            s -= L[p * 20 + i] * delta_a[p];
+        }
+        float da_val = s / L[i * 20 + i];
+        delta_a[i] = da_val;
+    }
+
+    for (int i = 0; i < 20; ++i) {
+        float qacc_val = a_0[i] + delta_a[i];
+        if (!isfinite(qacc_val) || !isfinite(qfrc_c[i])) {
+            solver_status_out[b_idx] = -3;
+            actual_iters_out[b_idx] = 0;
+            dual_residual_out[b_idx] = NAN;
+            for (int k = 0; k < 20; ++k) { qacc[k] = NAN; qfrc_c[k] = NAN; }
+            for (int k = 0; k < capacity; ++k) lam_out[k] = NAN;
+            return;
+        }
+        qacc[i] = qacc_val;
+    }
+
+    // 13. Write output forces and clean inactive padding
+    for (int i = 0; i < nefc; ++i) {
+        lam_out[i] = lam[i];
+    }
+    for (int i = nefc; i < capacity; ++i) {
+        lam_out[i] = 0.0f;
+    }
+
+    // Status: 0 if converged (projected gradient residual < tol and dual infeasibility <= 1e-4),
+    //         1 if unconverged within max_iters (bounded physical state),
+    //        -3 if non-finite.
+    int final_status = (max_proj_res < tol && max_dual_infeas <= 1e-4f) ? 0 : 1;
+    solver_status_out[b_idx] = final_status;
+    actual_iters_out[b_idx] = iters_taken;
+    dual_residual_out[b_idx] = max_proj_res;
+}
+
+// ==============================================================================
+// 6. ImplicitFast Time-Integration Kernel
+// ==============================================================================
+kernel void kernel_integrate_implicit_fast(
+    device const float* qpos_in [[buffer(0)]],            // (B, 21) current generalized coordinates
+    device const float* qvel_in [[buffer(1)]],            // (B, 20) current generalized velocities
+    device const float* qacc_in [[buffer(2)]],            // (B, 20) acceleration from solve
+    device const int* upstream_status [[buffer(3)]],      // (B,) upstream solver / physics status
+    constant float& dt [[buffer(4)]],                     // timestep (e.g. 0.005f)
+    device float* qpos_out [[buffer(5)]],                 // (B, 21) advanced coordinates
+    device float* qvel_out [[buffer(6)]],                 // (B, 20) advanced velocities
+    device int* integration_status_out [[buffer(7)]],     // (B,) integration status
+    uint tid [[thread_position_in_grid]]
+) {
+    uint b_idx = tid;
+
+    // 1. Upstream status guard: negative status prevents integration of invalid accelerations
+    int status = upstream_status[b_idx];
+    if (status < 0) {
+        integration_status_out[b_idx] = status;
+        for (int i = 0; i < 21; ++i) {
+            qpos_out[b_idx * 21 + i] = NAN;
+        }
+        for (int i = 0; i < 20; ++i) {
+            qvel_out[b_idx * 20 + i] = NAN;
+        }
+        return;
+    }
+
+    device const float* qp = qpos_in + b_idx * 21;
+    device const float* qv = qvel_in + b_idx * 20;
+    device const float* qa = qacc_in + b_idx * 20;
+
+    // 2. Non-finite input check
+    bool finite_inputs = true;
+    for (int i = 0; i < 21; ++i) {
+        if (!isfinite(qp[i])) { finite_inputs = false; break; }
+    }
+    for (int i = 0; i < 20; ++i) {
+        if (!isfinite(qv[i]) || !isfinite(qa[i])) { finite_inputs = false; break; }
+    }
+    if (!finite_inputs || !isfinite(dt) || dt <= 0.0f) {
+        integration_status_out[b_idx] = -1; // Non-finite input error
+        for (int i = 0; i < 21; ++i) {
+            qpos_out[b_idx * 21 + i] = NAN;
+        }
+        for (int i = 0; i < 20; ++i) {
+            qvel_out[b_idx * 20 + i] = NAN;
+        }
+        return;
+    }
+
+    // 3. Velocity update: v_{t+h} = v_t + dt * a
+    float v_next[20];
+    for (int i = 0; i < 20; ++i) {
+        v_next[i] = qv[i] + dt * qa[i];
+    }
+
+    // 4. Position update:
+    // Root linear translation (DOFs 0, 1, 2 -> qpos 0, 1, 2)
+    float p_next[3];
+    p_next[0] = qp[0] + dt * v_next[0];
+    p_next[1] = qp[1] + dt * v_next[1];
+    p_next[2] = qp[2] + dt * v_next[2];
+
+    // Root orientation: Hamilton quaternion integration q_{t+h} = q_t * dq(omega_{t+h} * dt)
+    // DOFs 3, 4, 5 represent angular velocity omega in local body frame
+    float3 omega = float3(v_next[3], v_next[4], v_next[5]);
+    float angle = length(omega) * dt;
+    float w2, x2, y2, z2;
+    if (angle > 1e-12f) {
+        float3 axis = omega / length(omega);
+        float s = sin(angle * 0.5f);
+        w2 = cos(angle * 0.5f);
+        x2 = s * axis.x;
+        y2 = s * axis.y;
+        z2 = s * axis.z;
+    } else {
+        w2 = 1.0f;
+        x2 = 0.5f * dt * omega.x;
+        y2 = 0.5f * dt * omega.y;
+        z2 = 0.5f * dt * omega.z;
+    }
+
+    // Current unit quaternion (w, x, y, z)
+    float w1 = qp[3], x1 = qp[4], y1 = qp[5], z1 = qp[6];
+
+    // Hamilton product: q_new = q_curr * dq
+    float w_new = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2;
+    float x_new = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2;
+    float y_new = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2;
+    float z_new = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2;
+
+    float q_invnorm = rsqrt(max(1e-14f, w_new * w_new + x_new * x_new + y_new * y_new + z_new * z_new));
+    w_new *= q_invnorm;
+    x_new *= q_invnorm;
+    y_new *= q_invnorm;
+    z_new *= q_invnorm;
+
+    // Hinge joints (joints 1 to 14, DOFs 6..19 -> qpos 7..20)
+    float jnt_next[14];
+    for (int j = 0; j < 14; ++j) {
+        jnt_next[j] = qp[7 + j] + dt * v_next[6 + j];
+    }
+
+    // 5. Write outputs (safe for in-place update where qpos_out == qpos_in or qvel_out == qvel_in)
+    device float* qp_out = qpos_out + b_idx * 21;
+    device float* qv_out = qvel_out + b_idx * 20;
+
+    qp_out[0] = p_next[0];
+    qp_out[1] = p_next[1];
+    qp_out[2] = p_next[2];
+
+    qp_out[3] = w_new;
+    qp_out[4] = x_new;
+    qp_out[5] = y_new;
+    qp_out[6] = z_new;
+
+    for (int j = 0; j < 14; ++j) {
+        qp_out[7 + j] = jnt_next[j];
+    }
+
+    for (int i = 0; i < 20; ++i) {
+        qv_out[i] = v_next[i];
+    }
+
+    integration_status_out[b_idx] = 0;
+}
+

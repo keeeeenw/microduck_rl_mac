@@ -25,6 +25,8 @@ class FootMeshData:
     vertnum: int
     graphadr: int
     vertices: np.ndarray  # (vertnum, 3) in local geom frame
+    graph: np.ndarray     # 1D int32 array of graph slice for this mesh
+    rbound: float         # geom bounding radius
 
 
 @dataclass
@@ -59,6 +61,21 @@ class CanonicalMicroDuckModel:
     jnt_axis: np.ndarray  # (njnt, 3)
     jnt_pos: np.ndarray  # (njnt, 3)
     jnt_bodyid: np.ndarray  # (njnt,)
+
+
+def _extract_mesh_graph_slice(m: mujoco.MjModel, dataid: int) -> np.ndarray:
+    gadr = m.mesh_graphadr[dataid]
+    if gadr < 0:
+        return np.zeros(0, dtype=np.int32)
+    numvert = m.mesh_graph[gadr]
+    vert_edgeadr = m.mesh_graph[gadr + 2 : gadr + 2 + numvert]
+    last_adr = vert_edgeadr[-1]
+    edge_start = gadr + 2 + 2 * numvert
+    cur = edge_start + last_adr
+    while m.mesh_graph[cur] >= 0:
+        cur += 1
+    total_ints = cur + 1 - gadr
+    return m.mesh_graph[gadr : gadr + total_ints].copy().astype(np.int32)
 
 
 def load_canonical_model() -> CanonicalMicroDuckModel:
@@ -100,12 +117,13 @@ def load_canonical_model() -> CanonicalMicroDuckModel:
         vertnum=l_vnum,
         graphadr=l_gadr,
         vertices=l_verts,
+        graph=_extract_mesh_graph_slice(m, l_dataid),
+        rbound=float(m.geom_rbound[left_foot_geom_id]),
     )
 
     # Extract right foot CAD mesh
     r_dataid = m.geom_dataid[right_foot_geom_id]
     r_vadr = m.mesh_vertadr[r_dataid]
-    r_vnum = m.mesh_vertnum[r_vadr if r_vadr < len(m.mesh_vertnum) else r_dataid] # mesh_vertnum index is dataid
     r_vnum = m.mesh_vertnum[r_dataid]
     r_gadr = m.mesh_graphadr[r_dataid]
     r_verts = m.mesh_vert[r_vadr : r_vadr + r_vnum].copy()
@@ -118,6 +136,8 @@ def load_canonical_model() -> CanonicalMicroDuckModel:
         vertnum=r_vnum,
         graphadr=r_gadr,
         vertices=r_verts,
+        graph=_extract_mesh_graph_slice(m, r_dataid),
+        rbound=float(m.geom_rbound[right_foot_geom_id]),
     )
 
     return CanonicalMicroDuckModel(

@@ -70,10 +70,10 @@ def test_cad_contact_manifold_separation(slice_engine):
     assert np.all(bodies == 7), f"Expected all contacts on body 7 (left foot), got bodies {bodies}"
 
 
-def test_canonical_manifold_solver_parity(slice_engine):
-    """Verifies that constraint solver equations match MuJoCo CPU reference to < 0.01 N and < 0.01 rad/s^2."""
+def test_cpu_reference_solver_diagnostic(slice_engine):
+    """Diagnostic: Verifies CPU constraint solver reference equations on identical canonical contact points match MuJoCo CPU reference to < 0.01 N and < 0.01 rad/s^2."""
     for state_name in ["standing", "single_support", "angled"]:
-        res_exact = slice_engine.verify_solver_canonical_manifold(state_name)
+        res_exact = slice_engine.verify_cpu_solver_reference(state_name)
         assert res_exact["err_force"] < 0.01, (
             f"State '{state_name}' exact solver force error {res_exact['err_force']:.6f} >= 0.01 N"
         )
