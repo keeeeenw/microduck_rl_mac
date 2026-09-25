@@ -10,30 +10,26 @@ policy inference and PPO training**. The original task managers, rewards,
 randomization and BAM actuator calculations are retained. The goal is to train
 locally on a Mac and deploy the same exported policy on Linux.
 
-Native Apple GPU physics also runs, but our current experimental implementation
-is substantially slower than CPU physics. Improving it is a later phase, using
-the working task configurations as baselines. Initial validation used an
-**M1 Max with 32 GB of unified memory**.
+**Flat-ground walking has been demonstrated with CPU physics + Apple GPU training
+on an M1 Max with 32 GB of unified memory (24-core GPU).** The completed run used
+4,096 environments and 6,000 PPO updates. The exported policy sustains forward
+walking in CPU simulation; precise speed, heading and low-speed command tracking
+remain incomplete. See the [evaluation and limitations](docs/walking-validation.md).
+
+![Mac-trained Microduck walking in CPU MuJoCo playback](docs/media/mac-flat-walking.gif)
+
+*Actual policy playback at real-time speed, not generated animation. Training:
+CPU MuJoCo + Torch MPS PPO. Playback: CPU MuJoCo + ONNX Runtime. Forward command:
+0.30 m/s; measured sustained speed is approximately 0.18 m/s.*
 
 Community support and pull requests are welcome. Reproducible bug reports,
 Apple Silicon test results, task validation and performance improvements help
 move the project forward. See the [training and playback guide](docs/mac-training.md).
 
-## Mac-specific improvements
-
-- **Native Apple GPU learning:** Torch MPS runs policy inference and PPO alongside
-  native CPU MuJoCo physics, preserving the original task and actuator models.
-- **Less copying and memory overhead:** the native training scene omits unused
-  environment visualization markers, and constraint buffers grow with actual
-  demand. This removes unnecessary work as environment counts increase.
-- **Playback aligned with training:** actuator delays advance at physics rate,
-  fixing excessive delay that could make a standing policy fall in playback.
-- **Portable policies and resumable training:** normalized ONNX exports target
-  the existing deployment interface; full checkpoints preserve native training
-  state, with configurable save intervals and external-drive output paths.
-
-See the training guide for measured results and validation limits. Apple Silicon's
-unified memory does not make this Python/Torch bridge zero-copy.
+For an end-to-end explanation of the existing reward, actor–critic, GAE and PPO
+method, see [How walking training works](docs/walking-rl-explained.md).
+These algorithms and the upstream training recipe are **not this project's contribution**;
+the guide explains the method this Mac implementation uses.
 
 ## Phases
 
@@ -41,26 +37,35 @@ unified memory does not make this Python/Torch bridge zero-copy.
    `Mjlab-Velocity-Flat-MicroDuck` and `Mjlab-Velocity-Rough-MicroDuck` working
    with a useful combination of simulation throughput and GPU learning. Validate
    training, checkpoint resume, playback and export. CPU physics with MPS learning
-   is the current choice; flat-task smoke tests pass, while rough terrain and
-   reliable learned walking remain to be validated.
+   is the current choice. **Flat-task training and sustained forward playback are
+   validated within the documented test conditions.** Broader command tracking
+   and rough terrain remain open.
 2. **Validate the remaining tasks.** Extend and qualify the other Microduck
    environments and policy families. Establish repeatable behavior, evaluation
    and performance baselines before claiming support for each task.
 3. **Improve native Apple GPU physics.** Use the validated walking and other tasks
    from phases 1–2 as baselines. Improve physics throughput while checking learning
    quality and simulation fidelity, and adopt GPU physics where it demonstrates
-   a practical advantage.
+   a practical advantage. The experimental unified Metal effort now runs rigid-body
+   dynamics, ground contacts, two-body self-contact constraint solving and PPO on
+   the Apple GPU, with short training/export and checkpoint-continuation tests.
+   **Self-contact narrowphase and reset-time synchronization still use the CPU.**
+   Fully native GPU physics, full task qualification and an end-to-end speed
+   advantage over CPU physics are not yet established.
 
 ## Limitations
 
 - Experimental and currently focused on Apple Silicon. Intel Macs are not supported.
-- The current Mac adapter is qualified only for flat-task smoke tests. Rough terrain
-  and other tasks still need backend support and validation.
+- Walking validation covers a single trained policy on nominal flat ground with
+  a bounded range of actuator delays and small initial-pose perturbations. Low-speed,
+  lateral and turn-in-place commands can leave it standing still; forward speed and
+  heading are imperfect. Rough terrain and other tasks remain unvalidated.
 - **These Mac changes and Mac-trained models have not been validated on Linux yet.**
-- CPU physics with GPU learning is currently faster than the experimental native
-  GPU physics path. Data transfers between CPU and GPU remain part of the workflow.
-- A successful smoke test does not establish walking quality, simulation equivalence
-  across backends or readiness for physical robot deployment.
+- CPU physics with MPS learning remains the recommended backend. Experimental
+  Metal physics still needs correctness and performance work; unified memory does
+  not automatically remove CPU/GPU transfers.
+- The playback results do not establish full training-distribution robustness,
+  simulation equivalence across backends or readiness for physical robot deployment.
 - Full Mac runtime, visualization and peripheral support is still in progress.
 
 Licensed under [Apache License 2.0](LICENSE), the same license as the original

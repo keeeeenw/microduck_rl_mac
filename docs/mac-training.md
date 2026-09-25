@@ -9,6 +9,12 @@ The recommended mode is native CPU MuJoCo physics with Torch MPS policy inferenc
 BAM actuator calculations, task managers and PPO learning. It preserves the original
 flat task's rewards, commands, randomization and learner configuration.
 
+**Completed walking baseline:** the 4,096-environment run finished 6,000 updates.
+Its final ONNX policy completed 52 bounded playback trials without falling, including
+four 60-second forward walks. Forward speed averaged about 0.18 m/s for a 0.30 m/s
+command. Low-speed, lateral and turn-in-place tracking remain incomplete. See
+[walking validation, exact protocol and results](walking-validation.md).
+
 ```bash
 uv sync --locked --extra mac-gpu --python 3.12
 uv run --locked --extra mac-gpu python -m mjlab_microduck.native_gpu.train \
@@ -123,11 +129,11 @@ uv run --locked --extra mac-gpu python -m mjlab_microduck.native_gpu.train \
   --log-dir logs/native-gpu/continued
 ```
 
-The initial 64-environment hybrid campaign and earlier GPU-physics campaign have
-been stopped with their checkpoints retained. The selected campaign continues the
-validated 4,096-environment checkpoint toward 6,000 total updates, with saves every
-250 updates on an external drive. Full-campaign completion and walking quality
-still require validation. For example, after the five-update smoke test:
+The initial 64-environment hybrid campaign and earlier GPU-physics campaign were
+stopped with checkpoints retained. The selected 4,096-environment campaign has
+now completed 6,000 total updates, with saves every 250 updates on an external
+drive. Its bounded walking evaluation is linked above. To launch an equivalent
+campaign after a five-update smoke test:
 
 ```bash
 uv run --locked --extra mac-gpu python -m mjlab_microduck.native_gpu.train \
@@ -156,8 +162,9 @@ Run outputs:
 - `policy.onnx`: normalized policy exported on normal completion, checked against
   the trained actor using ONNX Runtime. Its SHA-256 appears in the final status.
 
-The ONNX file is the intended cross-platform deployment artifact. Linux inference,
-robot runtime integration and useful walking behavior still require validation.
+The ONNX file is the intended cross-platform deployment artifact. Forward walking
+has been evaluated in Mac CPU playback; Linux inference and physical robot runtime
+integration still require validation.
 
 ## Interactive policy playback on Mac
 
@@ -170,11 +177,15 @@ From the repository root, after installing the environment above:
 
 ```bash
 mkdir -p artifacts/playback
-cp logs/native-gpu/smoke/policy.onnx artifacts/playback/policy.onnx
+cp logs/native-gpu/hybrid-walk-4096-20260920/policy.onnx artifacts/playback/policy.onnx
 .venv/bin/python scripts/play_mac.py \
   --walking artifacts/playback/policy.onnx \
-  --new-cmd-obs --delay 3 6 --lin-vel-x 0.05
+  --new-cmd-obs --delay 3 6 --lin-vel-x 0.30
 ```
+
+This example uses the completed local run; substitute your own export path if
+that run is unavailable. The evaluated policy walks at the 0.30 m/s command but
+can remain stationary at 0.05–0.15 m/s. Press Space to request a stop.
 
 For a run that is still training, the existing runner also refreshes a rolling
 ONNX export at checkpoint saves: `logs/native-gpu/<run>/<run>.onnx`. Copy that file
@@ -197,7 +208,7 @@ It does not change your shell configuration or the running trainer.
 Keep `--new-cmd-obs`: it selects the trained 61-input observation contract with
 13 command values. BAM M6 actuation is enabled by default; do not use `--no-bam`
 for this comparison. `--delay 3 6` enables actuator delay in physics steps, and
-`--lin-vel-x 0.05` starts with a small forward command. Playback uses nominal
+`--lin-vel-x 0.30` selects the demonstrated forward-walking command. Playback uses nominal
 battery settings and is not a replica of the randomized training distribution.
 
 The delay buffer advances at 200 Hz: 3–6 physics steps means 15–30 ms,

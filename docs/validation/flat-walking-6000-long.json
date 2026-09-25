@@ -1,0 +1,134 @@
+{
+  "policy_sha256": "6f7909b2fd710b0c1af771f38a052874c11e973570b6128d622fd0d36d2fcb2b",
+  "mujoco_version": "3.10.0",
+  "policy_rate_hz": 50,
+  "physics_rate_hz": 200,
+  "bam": {
+    "model": "m6",
+    "vin": 7.4,
+    "voltage_drop_gain": 0.1,
+    "minimum_vin": 6.0
+  },
+  "scope": "Nominal flat CPU playback with ONNX inference and BAM M6; no training-distribution randomization",
+  "fall_rule": "root height < 0.065 m, trunk tilt > 60 degrees, or nonfinite state/action; no autoreset",
+  "measurement": "body-frame vx, vy (m/s), local-root wz (rad/s); first 2 s excluded from averages",
+  "initialization": "seed 0 nominal; others roll/pitch +/-2 deg and joints +/-0.01 rad; seed and lag paired",
+  "results": [
+    {
+      "case": "forward_fast",
+      "seed": 0,
+      "actuator_delay_steps": 3,
+      "initial_command": [
+        0.3,
+        0.0,
+        0.0
+      ],
+      "duration_s": 60.0,
+      "fall_time_s": null,
+      "min_root_height_m": 0.11367740914459892,
+      "max_tilt_deg": 4.392234167135439,
+      "displacement_xy_m": [
+        -1.3535967620540763,
+        0.8315262750057751
+      ],
+      "path_length_m": 13.125992084282855,
+      "mean_body_velocity": [
+        0.1751224167502196,
+        -0.002618602725781162,
+        0.08603541091006253
+      ],
+      "tracking_rmse": [
+        0.126280994041666,
+        0.13628938406059543,
+        0.4786195367502663
+      ]
+    },
+    {
+      "case": "forward_fast",
+      "seed": 1,
+      "actuator_delay_steps": 4,
+      "initial_command": [
+        0.3,
+        0.0,
+        0.0
+      ],
+      "duration_s": 60.0,
+      "fall_time_s": null,
+      "min_root_height_m": 0.11342440561953501,
+      "max_tilt_deg": 4.528076563518385,
+      "displacement_xy_m": [
+        10.261287397947818,
+        3.3395822344526684
+      ],
+      "path_length_m": 13.819349085585408,
+      "mean_body_velocity": [
+        0.18332476425734615,
+        -0.005899086645353298,
+        0.007368907386341041
+      ],
+      "tracking_rmse": [
+        0.11868278728849058,
+        0.146888611090304,
+        0.3681133385491321
+      ]
+    },
+    {
+      "case": "forward_fast",
+      "seed": 2,
+      "actuator_delay_steps": 5,
+      "initial_command": [
+        0.3,
+        0.0,
+        0.0
+      ],
+      "duration_s": 60.0,
+      "fall_time_s": null,
+      "min_root_height_m": 0.11268539910899608,
+      "max_tilt_deg": 4.351656244477449,
+      "displacement_xy_m": [
+        11.105021795610257,
+        0.6012406800457618
+      ],
+      "path_length_m": 14.207368445383805,
+      "mean_body_velocity": [
+        0.1872835085520423,
+        -0.007717680096111406,
+        -0.002031910440623993
+      ],
+      "tracking_rmse": [
+        0.11492831965296367,
+        0.1524994475836633,
+        0.34210440538000847
+      ]
+    },
+    {
+      "case": "forward_fast",
+      "seed": 3,
+      "actuator_delay_steps": 6,
+      "initial_command": [
+        0.3,
+        0.0,
+        0.0
+      ],
+      "duration_s": 60.0,
+      "fall_time_s": null,
+      "min_root_height_m": 0.11240557118987304,
+      "max_tilt_deg": 4.46682062084627,
+      "displacement_xy_m": [
+        11.206330685551636,
+        -0.3634853407512423
+      ],
+      "path_length_m": 14.495308507801381,
+      "mean_body_velocity": [
+        0.18834416867858383,
+        -0.008781549653827592,
+        -0.0017356474114180102
+      ],
+      "tracking_rmse": [
+        0.11398873210227324,
+        0.15983929610188463,
+        0.31460269874741587
+      ]
+    }
+  ]
+}
