@@ -174,12 +174,8 @@ class MetalEnv(ManagerBasedRlEnv):
                 ManagerBasedRlEnv.__init__, Scene=MetalScene, Simulation=CpuSimulation
             )
         elif physics in ("metal", "unified_metal"):
-            import sys
-            from pathlib import Path
-            p = Path("/Users/zixiao/workspace/microduck/unified-metal")
-            if str(p) not in sys.path:
-                sys.path.insert(0, str(p))
-            from src.metal_simulation_adapter import UnifiedMetalSimulation
+            from .backend_selection import resolve_metal_backend
+            UnifiedMetalSimulation, _resolved_sources = resolve_metal_backend()
 
             initialize = _with_globals(
                 ManagerBasedRlEnv.__init__, Scene=MetalScene, Simulation=UnifiedMetalSimulation

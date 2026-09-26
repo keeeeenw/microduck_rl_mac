@@ -38,3 +38,6 @@ backup_onnx/
 logdir/.claude/
 logdir/
 logdir/.claude/worktrees/
+
+# Small reference corpus used by the opt-in Metal qualification suite.
+!tests/metal/corpus/*.npz

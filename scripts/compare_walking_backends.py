@@ -41,13 +41,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-UNIFIED_METAL = PROJECT_ROOT / "unified-metal"
-MICRODUCK_RL = PROJECT_ROOT / "microduck_rl"
+MICRODUCK_RL = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = MICRODUCK_RL / "scripts"
+METAL_PACKAGE = MICRODUCK_RL / "src" / "mjlab_microduck" / "native_gpu" / "metal"
 
-if str(UNIFIED_METAL) not in sys.path:
-    sys.path.insert(0, str(UNIFIED_METAL))
 if str(MICRODUCK_RL / "src") not in sys.path:
     sys.path.insert(0, str(MICRODUCK_RL / "src"))
 if str(SCRIPTS_DIR) not in sys.path:
@@ -699,9 +696,9 @@ def main():
         "evaluator_script_sha256": sha256_file(Path(__file__).resolve()),
         "source_hashes": {
             "evaluator_helpers.py": sha256_file(SCRIPTS_DIR / "evaluator_helpers.py"),
-            "metal_simulation_adapter.py": sha256_file(UNIFIED_METAL / "src" / "metal_simulation_adapter.py"),
-            "physics_slice.metal": sha256_file(UNIFIED_METAL / "shaders" / "physics_slice.metal"),
-            "representative_physics_slice.py": sha256_file(UNIFIED_METAL / "src" / "representative_physics_slice.py"),
+            "metal_simulation_adapter.py": sha256_file(METAL_PACKAGE / "metal_simulation_adapter.py"),
+            "physics_slice.metal": sha256_file(METAL_PACKAGE / "shaders" / "physics_slice.metal"),
+            "representative_physics_slice.py": sha256_file(METAL_PACKAGE / "representative_physics_slice.py"),
             "cpu_simulation.py": sha256_file(MICRODUCK_RL / "src" / "mjlab_microduck" / "native_gpu" / "cpu_simulation.py"),
             "environment.py": sha256_file(MICRODUCK_RL / "src" / "mjlab_microduck" / "native_gpu" / "environment.py"),
             "scene.xml": sha256_file(MICRODUCK_RL / "src" / "mjlab_microduck" / "robot" / "microduck" / "scene.xml"),

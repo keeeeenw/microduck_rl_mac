@@ -1,4 +1,4 @@
-"""Experimental native Apple GPU qualification; not a supported training backend yet.
+"""Mac training with CPU physics by default and opt-in experimental GPU physics.
 
 Importing this package does not register tasks, select a device, or patch JAX.
 """

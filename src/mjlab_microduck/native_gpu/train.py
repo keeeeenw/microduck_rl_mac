@@ -27,15 +27,31 @@ def main():
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save-interval", type=int, default=25)
-    parser.add_argument("--log-dir", type=Path, required=True)
+    parser.add_argument("--log-dir", type=Path)
+    parser.add_argument("--verify-backend-only", action="store_true", help="CPU-only source path preflight")
     parser.add_argument("--resume", type=Path)
     parser.add_argument(
         "--physics",
         choices=("mps", "cpu", "metal", "unified_metal"),
         default="cpu",
-        help="Physics backend (default: cpu). Policy inference and PPO always use MPS.",
+        help="Physics backend (default: cpu; metal is experimental). Policy inference and PPO always use MPS.",
     )
     args = parser.parse_args()
+    if args.verify_backend_only:
+        from .backend_selection import resolve_metal_backend
+        _, paths = resolve_metal_backend()
+        print(json.dumps(paths, indent=2, sort_keys=True))
+        return
+    if args.log_dir is None:
+        parser.error("--log-dir is required for training")
+    if args.physics in ("metal", "unified_metal"):
+        from .backend_selection import resolve_metal_backend
+        _, backend_source_paths = resolve_metal_backend()
+        if platform.system() != "Darwin" or platform.machine() != "arm64":
+            parser.error("Experimental Metal physics requires an Apple Silicon Mac")
+        print("Experimental Metal physics: flat walking only; broader validation remains open.", file=sys.stderr)
+    else:
+        backend_source_paths = None
     if min(args.num_envs, args.iterations, args.save_interval) < 1:
         parser.error("Environment count, iterations and save interval must be positive")
     os.environ["JAX_PLATFORMS"] = "mps" if args.physics == "mps" else "cpu"
@@ -75,24 +91,21 @@ def main():
         str(p.relative_to(repository)): hashlib.sha256(p.read_bytes()).hexdigest()
         for p in sorted(source_root.rglob("*.py"))
     }
-    unified_metal_dir = repository.parent / "unified-metal"
-    if args.physics in ("metal", "unified_metal") and unified_metal_dir.exists():
-        for p in sorted((unified_metal_dir / "src").rglob("*.py")):
-            source_sha256[str(p.relative_to(repository.parent))] = hashlib.sha256(
-                p.read_bytes()
-            ).hexdigest()
-        for p in sorted((unified_metal_dir / "shaders").rglob("*.metal")):
-            source_sha256[str(p.relative_to(repository.parent))] = hashlib.sha256(
-                p.read_bytes()
-            ).hexdigest()
+    if backend_source_paths:
+        # Hash package resources as well as Python sources. No sibling repository
+        # is needed, including when this package is installed from a wheel.
+        for p in sorted((source_root / "native_gpu" / "metal").rglob("*")):
+            if p.is_file() and p.suffix in (".metal", ".xml"):
+                source_sha256[str(p.relative_to(repository))] = hashlib.sha256(p.read_bytes()).hexdigest()
     manifest = {
         "command": sys.argv,
         "python": sys.version,
         "platform": platform.platform(),
         "source_sha256": source_sha256,
+        "backend_source_paths": backend_source_paths,
         "lock_sha256": hashlib.sha256(
             (repository / "uv.lock").read_bytes()
-        ).hexdigest(),
+        ).hexdigest() if (repository / "uv.lock").is_file() else None,
         "versions": {
             name: importlib.metadata.version(name)
             for name in (
@@ -278,6 +291,8 @@ def main():
                 "collision_narrowphase_seconds_total": getattr(env.sim, "collision_narrowphase_seconds", 0.0),
                 "collision_fallback_branch_seconds_total": getattr(env.sim, "collision_fallback_branch_seconds", 0.0),
                 "collision_evaluations_count": getattr(env.sim, "collision_evaluations_count", 0),
+                "constants_recomputed_envs_total": getattr(env.sim, "constants_recomputed_envs", 0),
+                "constants_cache_skips_total": getattr(env.sim, "constants_cache_skips", 0),
                 "max_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
             }
             with (directory / "progress.jsonl").open("a") as stream:
