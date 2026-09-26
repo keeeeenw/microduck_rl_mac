@@ -173,6 +173,17 @@ class MetalEnv(ManagerBasedRlEnv):
             initialize = _with_globals(
                 ManagerBasedRlEnv.__init__, Scene=MetalScene, Simulation=CpuSimulation
             )
+        elif physics in ("metal", "unified_metal"):
+            import sys
+            from pathlib import Path
+            p = Path("/Users/zixiao/workspace/microduck/unified-metal")
+            if str(p) not in sys.path:
+                sys.path.insert(0, str(p))
+            from src.metal_simulation_adapter import UnifiedMetalSimulation
+
+            initialize = _with_globals(
+                ManagerBasedRlEnv.__init__, Scene=MetalScene, Simulation=UnifiedMetalSimulation
+            )
         elif physics != "mps":
             raise ValueError(f"Unknown physics backend: {physics}")
         initialize(self, cfg, device, **kwargs)

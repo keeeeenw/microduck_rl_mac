@@ -31,7 +31,7 @@ def main():
     parser.add_argument("--resume", type=Path)
     parser.add_argument(
         "--physics",
-        choices=("mps", "cpu"),
+        choices=("mps", "cpu", "metal", "unified_metal"),
         default="cpu",
         help="Physics backend (default: cpu). Policy inference and PPO always use MPS.",
     )
@@ -58,21 +58,38 @@ def main():
         "task": "Mjlab-Velocity-Flat-MicroDuck",
         "device": "mps",
         "physics_backend": args.physics,
-        "transfer_mode": "CPU physics / MPS managers, BAM and PPO"
-        if args.physics == "cpu"
-        else "host-staged copies between GPU frameworks; no CPU numerics",
+        "transfer_mode": (
+            "CPU physics / MPS managers, BAM and PPO"
+            if args.physics == "cpu"
+            else (
+                "Device-resident dynamics with CPU narrowphase fallback and reset-time constant synchronization"
+                if args.physics in ("metal", "unified_metal")
+                else "host-staged copies between GPU frameworks; no CPU numerics"
+            )
+        ),
     }
     atomic_json(status_path, status)
     source_root = Path(__file__).resolve().parents[1]
     repository = source_root.parents[1]
+    source_sha256 = {
+        str(p.relative_to(repository)): hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in sorted(source_root.rglob("*.py"))
+    }
+    unified_metal_dir = repository.parent / "unified-metal"
+    if args.physics in ("metal", "unified_metal") and unified_metal_dir.exists():
+        for p in sorted((unified_metal_dir / "src").rglob("*.py")):
+            source_sha256[str(p.relative_to(repository.parent))] = hashlib.sha256(
+                p.read_bytes()
+            ).hexdigest()
+        for p in sorted((unified_metal_dir / "shaders").rglob("*.metal")):
+            source_sha256[str(p.relative_to(repository.parent))] = hashlib.sha256(
+                p.read_bytes()
+            ).hexdigest()
     manifest = {
         "command": sys.argv,
         "python": sys.version,
         "platform": platform.platform(),
-        "source_sha256": {
-            str(p.relative_to(repository)): hashlib.sha256(p.read_bytes()).hexdigest()
-            for p in sorted(source_root.rglob("*.py"))
-        },
+        "source_sha256": source_sha256,
         "lock_sha256": hashlib.sha256(
             (repository / "uv.lock").read_bytes()
         ).hexdigest(),
@@ -252,6 +269,15 @@ def main():
                 else None,
                 "transfer_bytes_total": env.sim.transfer.bytes,
                 "transfer_seconds_total": env.sim.transfer.seconds,
+                "reset_transfer_bytes_total": getattr(getattr(env.sim, "reset_transfer", None), "bytes", 0),
+                "reset_transfer_seconds_total": getattr(getattr(env.sim, "reset_transfer", None), "seconds", 0.0),
+                "collision_qpos_staging_bytes_total": getattr(env.sim, "collision_qpos_staging_bytes", 0),
+                "collision_fric_staging_bytes_total": getattr(env.sim, "collision_fric_staging_bytes", 0),
+                "collision_transfer_bytes_total": getattr(getattr(env.sim, "collision_transfer", None), "bytes", 0),
+                "collision_transfer_seconds_total": getattr(getattr(env.sim, "collision_transfer", None), "seconds", 0.0),
+                "collision_narrowphase_seconds_total": getattr(env.sim, "collision_narrowphase_seconds", 0.0),
+                "collision_fallback_branch_seconds_total": getattr(env.sim, "collision_fallback_branch_seconds", 0.0),
+                "collision_evaluations_count": getattr(env.sim, "collision_evaluations_count", 0),
                 "max_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
             }
             with (directory / "progress.jsonl").open("a") as stream:
