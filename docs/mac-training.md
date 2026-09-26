@@ -27,8 +27,17 @@ checkpoint continuation passed with 64 environments, 24 rollout steps per update
 finite losses/gradients, no logged NaN terminations, and normalized ONNX export
 comparison. This does not establish useful walking or performance on other Macs.
 
-The `mac-gpu` dependency extra supports both physics modes. Torch MPS fallback is
-disabled in both: choosing CPU physics is explicit, not a silent GPU fallback.
+The `mac-gpu` dependency extra supports the native Mac profiles. Torch MPS
+fallback is disabled: choosing CPU physics is explicit, not a silent GPU fallback.
+
+### Experimental Unified Metal physics
+
+Use `--physics metal` to opt into the bundled Apple GPU physics backend. It is
+available for community testing and improvement, but still requires broader
+validation. CPU physics remains the default. No separate backend checkout or
+private path configuration is required. Start with the five-update smoke command
+in the [experimental Metal guide](experimental-metal.md), which also covers
+resume, qualification tests, current evidence and limitations.
 
 ### Physics backend measurements
 

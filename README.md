@@ -22,6 +22,12 @@ remain incomplete. See the [evaluation and limitations](docs/walking-validation.
 CPU MuJoCo + Torch MPS PPO. Playback: CPU MuJoCo + ONNX Runtime. Forward command:
 0.30 m/s; measured sustained speed is approximately 0.18 m/s.*
 
+**Experimental Unified Metal physics is now available for community testing.**
+It combines native Apple GPU dynamics and constraint solving with MPS PPO, while
+retaining CPU self-contact narrowphase and reset-time work. It still requires
+broader validation; CPU physics remains the recommended default. See the
+[experimental Metal guide](docs/experimental-metal.md) to try it and contribute.
+
 Community support and pull requests are welcome. Reproducible bug reports,
 Apple Silicon test results, task validation and performance improvements help
 move the project forward. See the [training and playback guide](docs/mac-training.md).
@@ -46,12 +52,13 @@ the guide explains the method this Mac implementation uses.
 3. **Improve native Apple GPU physics.** Use the validated walking and other tasks
    from phases 1–2 as baselines. Improve physics throughput while checking learning
    quality and simulation fidelity, and adopt GPU physics where it demonstrates
-   a practical advantage. The experimental unified Metal effort now runs rigid-body
-   dynamics, ground contacts, two-body self-contact constraint solving and PPO on
-   the Apple GPU, with short training/export and checkpoint-continuation tests.
-   **Self-contact narrowphase and reset-time synchronization still use the CPU.**
-   Fully native GPU physics, full task qualification and an end-to-end speed
-   advantage over CPU physics are not yet established.
+   a practical advantage. **Unified Metal is available as an experimental,
+   opt-in backend.** The implementation has passed bounded physics, training,
+   export and checkpoint-continuation checks on an M1 Max, and a longer training
+   pilot is underway. Community validation, bug reports and pull requests are
+   welcome. CPU narrowphase and reset-time work remain; broader task support,
+   robust walking quality and a sustained speed advantage over CPU physics
+   still need validation.
 
 ## Limitations
 
@@ -61,9 +68,12 @@ the guide explains the method this Mac implementation uses.
   lateral and turn-in-place commands can leave it standing still; forward speed and
   heading are imperfect. Rough terrain and other tasks remain unvalidated.
 - **These Mac changes and Mac-trained models have not been validated on Linux yet.**
-- CPU physics with MPS learning remains the recommended backend. Experimental
-  Metal physics still needs correctness and performance work; unified memory does
-  not automatically remove CPU/GPU transfers.
+- CPU physics with MPS learning remains the recommended backend.
+  Metal physics is an experimental feature, not a fully validated replacement.
+  Its packaged integration still needs a new GPU smoke/continuation run; the
+  earlier qualified implementation and CPU packaging checks are the current
+  evidence. Broader hardware, task and performance validation remains open.
+  Unified memory does not automatically remove CPU/GPU transfers.
 - The playback results do not establish full training-distribution robustness,
   simulation equivalence across backends or readiness for physical robot deployment.
 - Full Mac runtime, visualization and peripheral support is still in progress.
