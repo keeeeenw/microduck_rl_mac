@@ -99,12 +99,41 @@ cover this integration. **A fresh GPU smoke and continuation check on the packag
 entry point remain pending**; they were deferred to avoid interfering with the
 active pilot. Please start with the smoke test on your machine and report results.
 
-A short optimization comparison against the earlier Metal implementation found a
-ratio of median trial wall times of approximately 1.076×, with individual ratios
-of 0.990×, 1.086× and 1.161×. Each trial measured 10 updates after excluding five
-warmup updates, with identical starting checkpoints and task settings. The spread
-is substantial. This is a preliminary Metal-to-Metal result, **not a demonstrated
-speedup over CPU physics** or a promise for other workloads and Macs.
+### Observed training speed
+
+The longer training logs show a larger gain than the small, recent Metal-to-Metal
+optimization. On the same M1 Max (32 GB unified memory, 24-core GPU), the observed
+median collection-plus-PPO throughput was approximately **1.31× the CPU-physics
+run for the original Unified Metal implementation**, and **1.46× for the updated
+Metal candidate**:
+
+| Training run | Environments | Updates measured | Median collection + PPO / update | Median transitions/s |
+| --- | ---: | --- | ---: | ---: |
+| Completed CPU physics + MPS PPO | 4,096 | 16–6,000 (5,985 updates) | 51.42 s | 1,912 |
+| Original Unified Metal + MPS PPO, subsequently stopped | 2,048 | 11–3,931 (3,921 updates) | 19.61 s | 2,507 |
+| Updated Unified Metal + MPS PPO, ongoing pilot | 2,048 | 3,512–3,622 (111 updates) | 17.55 s | 2,801 |
+
+Snapshot: September 26, 2026, with fixed cutoffs shown above; the first ten records
+of each run are excluded. These are measurements from the actual training jobs,
+not extrapolations from a short smoke test. The current candidate has a shorter
+observation window than the original Metal run. Median consecutive logged wall
+intervals, including other update overhead, were 52.58 s, 20.57 s and 18.81 s,
+respectively.
+
+**Compare transitions/second, not updates/second:** Metal used half as many
+environments, so an update contained 49,152 samples versus 98,304 for the CPU run.
+The candidate's updates completed roughly three times as quickly, but the observed
+sample-throughput gain was about **46%**, not threefold. These historical runs
+have different batch sizes, training stages and runtime conditions; the ratios
+describe observed training throughput, not a controlled backend-only speedup or
+faster convergence to a walking policy. Broader hardware and matched CPU/Metal
+comparisons remain open.
+
+Separately, the recent optimization over the earlier Metal implementation measured
+approximately **1.076×** using the ratio of median trial wall times (individual
+trial ratios: 0.990×, 1.086× and 1.161×). That small comparison isolates an
+incremental Metal optimization; it does not represent the whole transition from
+CPU physics to Unified Metal.
 
 The backend has separate collision and reset transfer counters. A zero general
 `transfer_bytes_total` counter does not mean zero staging. Timers can overlap and

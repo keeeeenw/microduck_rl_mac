@@ -28,6 +28,13 @@ retaining CPU self-contact narrowphase and reset-time work. It still requires
 broader validation; CPU physics remains the recommended default. See the
 [experimental Metal guide](docs/experimental-metal.md) to try it and contribute.
 
+**Observed training throughput is 31–46% higher with Unified Metal on the tested
+M1 Max.** Actual runs recorded about 2,507–2,801 transitions/s, compared with
+1,912 for CPU physics + MPS PPO. These are historical runs with different
+environment counts and training stages, not a controlled backend-only benchmark
+or a claim of faster learning convergence. See the
+[measurement windows and limitations](docs/experimental-metal.md#observed-training-speed).
+
 Community support and pull requests are welcome. Reproducible bug reports,
 Apple Silicon test results, task validation and performance improvements help
 move the project forward. See the [training and playback guide](docs/mac-training.md).
@@ -57,8 +64,9 @@ the guide explains the method this Mac implementation uses.
    export and checkpoint-continuation checks on an M1 Max, and a longer training
    pilot is underway. Community validation, bug reports and pull requests are
    welcome. CPU narrowphase and reset-time work remain; broader task support,
-   robust walking quality and a sustained speed advantage over CPU physics
-   still need validation.
+   robust walking quality and controlled CPU/Metal performance comparisons
+   still need validation. Actual training logs show higher observed throughput
+   for Metal on the tested Mac; see the [measurements and scope](docs/experimental-metal.md#observed-training-speed).
 
 ## Limitations
 
